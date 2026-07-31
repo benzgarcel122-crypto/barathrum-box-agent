@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ box_name }} — Admin</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="admin-shell">
+  <nav>
+    <div class="brand">{{ box_name }}</div>
+    <a href="/admin" class="active">Status</a>
+    <a href="/admin/sessions">Sessions</a>
+    <a href="/admin/settings">Settings</a>
+    <a href="/admin/logout" class="logout">Log out</a>
+  </nav>
+  <main>
+    <h1>Status</h1>
+    <div class="stat-grid">
+      <div class="stat-card">
+        <div class="stat-value">{{ connected_count }}</div>
+        <div class="stat-label">Active sessions</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">₱{{ todays_earnings }}</div>
+        <div class="stat-label">Today's earnings</div>
+      </div>
+    </div>
+    <p class="hint">
+      This box operates locally and offline-first — earnings/session data here
+      reflects only this box's own coin acceptor activity, not the cloud
+      dashboard's operator wallet (that's a separate system entirely).
+    </p>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Barathrum Admin</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="admin-card">
+  <h1>Admin Login</h1>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="post">
+    <label>Password</label>
+    <input type="password" name="password" autofocus required>
+    <button type="submit">Log in</button>
+  </form>
+</div>
+</body>
+</html>

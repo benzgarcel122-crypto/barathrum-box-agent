@@ -1,0 +1,30 @@
+# hostapd config template for the Barathrum box agent.
+# Rendered at runtime by network_manager.render_hostapd_config() --
+# {{INTERFACE}}, {{SSID}}, and {{WPA_BLOCK}} are substituted in.
+#
+# NOTE: this assumes a USB WiFi adapter using an in-kernel driver with
+# confirmed AP-mode support (recommended: MediaTek/Ralink RT5370 or
+# Atheros AR9271 chipset -- see MPD STEP 1 rule #2 correction, Session
+# 59). The Orange Pi One has no onboard WiFi hardware; {{INTERFACE}}
+# must match whatever interface name the USB adapter enumerates as
+# (check with `ip link` on the real board -- commonly wlan0, but not
+# guaranteed).
+
+interface={{INTERFACE}}
+driver=nl80211
+ssid={{SSID}}
+hw_mode=g
+channel=6
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+
+# WPA2-PSK when a passphrase is set; the {{WPA_BLOCK}} placeholder below
+# is left EMPTY entirely for the temporary open Setup Wizard network
+# (network_manager.py's render_hostapd_config() branches on this) --
+# hostapd requires the wpa* lines to be fully absent for an open network,
+# not present with an empty wpa_passphrase value (which hostapd rejects
+# outright at startup, so the temporary setup network would never come
+# up at all under the old always-render behavior this replaces).
+{{WPA_BLOCK}}
+wmm_enabled=1

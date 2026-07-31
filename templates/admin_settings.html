@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings — Admin</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="admin-shell">
+  <nav>
+    <div class="brand">Barathrum</div>
+    <a href="/admin">Status</a>
+    <a href="/admin/sessions">Sessions</a>
+    <a href="/admin/settings" class="active">Settings</a>
+    <a href="/admin/logout" class="logout">Log out</a>
+  </nav>
+  <main>
+    <h1>Settings</h1>
+    <form method="post">
+      <input type="hidden" name="step" value="1">
+
+      <section>
+        <h2>Rate</h2>
+        <label>Pesos per coin pulse</label>
+        <input type="number" name="pesos_per_pulse" value="{{ pesos_per_pulse }}" min="1" required>
+        <label>Minutes granted per pulse</label>
+        <input type="number" name="minutes_per_pulse" value="{{ minutes_per_pulse }}" min="1" required>
+      </section>
+
+      <section>
+        <h2>Customer WiFi</h2>
+        <label>SSID</label>
+        <input type="text" name="customer_ssid" value="{{ customer_ssid }}" required>
+        <label>Password (leave blank to keep current)</label>
+        <input type="password" name="customer_wifi_password" placeholder="••••••••">
+      </section>
+
+      <section>
+        <h2>Hardware (read-only — re-verify against real board before wiring)</h2>
+        <p class="hint">Coin pin: {{ coin_pin }} · Relay pin: {{ relay_pin }}</p>
+        <p class="hint">Arm ignore window: {{ arm_ignore_window }}s · Accept window: {{ arm_accept_window }}s</p>
+      </section>
+
+      <button type="submit" class="btn-primary">Save</button>
+    </form>
+  </main>
+</div>
+</body>
+</html>

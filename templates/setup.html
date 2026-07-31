@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Barathrum Setup</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="admin-card">
+  <h1>Barathrum Setup</h1>
+
+  {% if step == 1 %}
+    <p class="hint">Step 1 of 4 — Enter your license key (from your Barathrum dashboard account).</p>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <form method="post">
+      <input type="hidden" name="step" value="1">
+      <label>License key</label>
+      <input type="text" name="license_key" required autofocus>
+      <button type="submit" class="btn-primary">Continue</button>
+    </form>
+
+  {% elif step == 2 %}
+    <p class="hint">Step 2 of 4 — Set up your customer-facing WiFi and admin password.</p>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <form method="post">
+      <input type="hidden" name="step" value="2">
+      <label>Customer WiFi network name (SSID)</label>
+      <input type="text" name="customer_ssid" required>
+      <label>Admin password</label>
+      <input type="password" name="admin_password" required>
+      <label>Confirm admin password</label>
+      <input type="password" name="confirm_password" required>
+      <button type="submit" class="btn-primary">Continue</button>
+    </form>
+
+  {% elif step == 3 %}
+    <p class="hint">Step 3 of 4 — Set your customer WiFi password.</p>
+    <form id="wifi-password-form">
+      <label>Customer WiFi password</label>
+      <input type="password" id="customer_wifi_password" required minlength="8">
+      <button type="button" class="btn-primary" onclick="submitReboot()">Finish setup</button>
+    </form>
+
+  {% elif step == 4 %}
+    <p class="hint">Step 4 of 4 — Rebooting onto your live network. This box is ready.</p>
+  {% endif %}
+</div>
+
+<script>
+async function submitReboot() {
+  const password = document.getElementById('customer_wifi_password').value;
+  const body = new URLSearchParams();
+  body.set('customer_wifi_password', password);
+  await fetch('/setup/reboot', { method: 'POST', body });
+  document.querySelector('.admin-card').innerHTML =
+    '<h1>Barathrum Setup</h1><p class="hint">Step 4 of 4 — Rebooting onto your live network. This box is ready.</p>';
+}
+</script>
+</body>
+</html>

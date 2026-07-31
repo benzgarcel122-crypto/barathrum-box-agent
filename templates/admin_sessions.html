@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sessions — Admin</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="admin-shell">
+  <nav>
+    <div class="brand">Barathrum</div>
+    <a href="/admin">Status</a>
+    <a href="/admin/sessions" class="active">Sessions</a>
+    <a href="/admin/settings">Settings</a>
+    <a href="/admin/logout" class="logout">Log out</a>
+  </nav>
+  <main>
+    <h1>Sessions</h1>
+    <table>
+      <thead>
+        <tr><th>MAC address</th><th>Status</th><th>Remaining</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for s in sessions %}
+        <tr>
+          <td>{{ s.mac_address }}</td>
+          <td><span class="badge badge-{{ s.status }}">{{ s.status }}</span></td>
+          <td>{{ (s.remaining_seconds // 60) }} min</td>
+          <td>
+            <form method="post" action="/admin/sessions/{{ s.session_token }}/revoke" onsubmit="return confirm('Revoke this session immediately?');">
+              <button type="submit" class="btn-danger-small">Revoke</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="empty">No active or paused sessions right now.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </main>
+</div>
+</body>
+</html>

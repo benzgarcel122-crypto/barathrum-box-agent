@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Barathrum</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #171a21;
+    --text: #f4f5f7;
+    --muted: #9aa1ac;
+    --accent: #3ddc84;
+    --warn: #f5a623;
+    --danger: #e5484d;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+  }
+  .card {
+    width: 100%; max-width: 380px; background: var(--card); border-radius: var(--radius);
+    padding: 32px 24px; text-align: center;
+  }
+  .logo { font-size: 22px; font-weight: 700; letter-spacing: 0.02em; margin-bottom: 4px; }
+  .rate { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .timer { font-size: 48px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 8px 0 4px; }
+  .timer.ending-soon { color: var(--warn); }
+  .timer.expired { color: var(--danger); }
+  .subtext { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+  button {
+    width: 100%; padding: 16px; border: none; border-radius: 10px; font-size: 16px;
+    font-weight: 600; cursor: pointer; margin-top: 10px;
+  }
+  .btn-primary { background: var(--accent); color: #06210f; }
+  .btn-secondary { background: #2a2f3a; color: var(--text); }
+  .row { display: flex; gap: 10px; }
+  .row button { margin-top: 10px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 16px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<div class="card" id="app">
+  <div class="logo">BARATHRUM</div>
+  <div class="rate" id="rate-line">Loading...</div>
+
+  <!-- All 7 states render into #state-area; JS swaps content based on
+       /api/session/status polling. Server-rendered initial state below
+       avoids a flash-of-nothing before the first poll completes. -->
+  <div id="state-area">
+    {% if session.status == 'expired' or session.remaining_seconds <= 0 %}
+      <div class="timer expired">00:00</div>
+      <div class="subtext">Time's up. Insert a coin to start a new session.</div>
+      <button class="btn-primary" onclick="armCoinAcceptor()">Insert Coin</button>
+    {% elif session.status == 'paused' %}
+      <div class="timer">{{ (session.remaining_seconds // 60) }}:{{ '%02d' % (session.remaining_seconds % 60) }}</div>
+      <div class="subtext">Session paused. Your time is saved.</div>
+      <button class="btn-primary" onclick="resumeSession()">Resume</button>
+      <button class="btn-secondary" onclick="armCoinAcceptor()">Insert Coin</button>
+    {% elif session.status == 'active' %}
+      <div class="timer" id="active-timer">{{ (session.remaining_seconds // 60) }}:{{ '%02d' % (session.remaining_seconds % 60) }}</div>
+      <div class="subtext">Connected. Enjoy!</div>
+      <div class="row">
+        <button class="btn-secondary" onclick="armCoinAcceptor()">Insert More Coins</button>
+        <button class="btn-secondary" onclick="pauseSession()">Pause</button>
+      </div>
+    {% else %}
+      <div class="timer">00:00</div>
+      <div class="subtext">Tap below to start.</div>
+      <button class="btn-primary" onclick="armCoinAcceptor()">Insert Coin</button>
+    {% endif %}
+  </div>
+
+  <div class="hint" id="armed-hint" style="display:none;">
+    Coin acceptor is ready — insert your coin(s) now.
+  </div>
+</div>
+
+<script>
+function fmt(totalSeconds) {
+  totalSeconds = Math.max(0, Math.floor(totalSeconds));
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+async function armCoinAcceptor() {
+  await fetch('/api/insert-coin/arm', { method: 'POST' });
+  document.getElementById('armed-hint').style.display = 'block';
+}
+
+async function pauseSession() {
+  await fetch('/api/session/pause', { method: 'POST' });
+  poll();
+}
+
+async function resumeSession() {
+  await fetch('/api/session/resume', { method: 'POST' });
+  poll();
+}
+
+function render(data) {
+  const area = document.getElementById('state-area');
+  const rateLine = document.getElementById('rate-line');
+  rateLine.textContent = 'Rate applies per operator settings';
+
+  if (data.status === 'active') {
+    const timerClass = data.ending_soon ? 'timer ending-soon' : 'timer';
+    area.innerHTML = `
+      <div class="${timerClass}">${fmt(data.remaining_seconds)}</div>
+      <div class="subtext">${data.ending_soon ? 'Session ending soon' : 'Connected. Enjoy!'}</div>
+      <div class="row">
+        <button class="btn-secondary" onclick="armCoinAcceptor()">Insert More Coins</button>
+        <button class="btn-secondary" onclick="pauseSession()">Pause</button>
+      </div>`;
+  } else if (data.status === 'paused') {
+    area.innerHTML = `
+      <div class="timer">${fmt(data.remaining_seconds)}</div>
+      <div class="subtext">Session paused. Your time is saved.</div>
+      <button class="btn-primary" onclick="resumeSession()">Resume</button>
+      <button class="btn-secondary" onclick="armCoinAcceptor()">Insert Coin</button>`;
+  } else {
+    // 'expired' or a fresh zero-balance session
+    const label = data.armed ? 'Coin acceptor ready — insert your coin(s).' : 'Insert a coin to start a new session.';
+    area.innerHTML = `
+      <div class="timer expired">00:00</div>
+      <div class="subtext">${label}</div>
+      <button class="btn-primary" onclick="armCoinAcceptor()">Insert Coin</button>`;
+  }
+}
+
+async function poll() {
+  try {
+    const resp = await fetch('/api/session/status');
+    const data = await resp.json();
+    render(data);
+  } catch (e) {
+    // Portal unreachable momentarily (e.g. box under load) -- fail
+    // quietly and retry on the next interval rather than showing an
+    // alarming error to the customer.
+  }
+}
+
+poll();
+setInterval(poll, 3000);
+</script>
+
+</body>
+</html>

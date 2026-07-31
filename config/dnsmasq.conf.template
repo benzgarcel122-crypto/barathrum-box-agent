@@ -1,0 +1,21 @@
+# dnsmasq config template for the Barathrum box agent.
+# Rendered at runtime by network_manager.render_dnsmasq_config().
+
+interface={{INTERFACE}}
+bind-interfaces
+
+dhcp-range={{DHCP_RANGE_START}},{{DHCP_RANGE_END}},{{DHCP_LEASE_TIME}}
+dhcp-option=3,{{GATEWAY_IP}}   # default gateway handed to customers
+dhcp-option=6,{{GATEWAY_IP}}   # DNS server = the box itself
+
+# Captive portal detection: resolve every hostname to the box's own
+# gateway IP so phone OS connectivity-check requests get redirected here
+# (this is what makes the native "Sign in to network" prompt appear --
+# STEP 1 customer-facing flow step 2). A production build should scope
+# this more precisely (e.g. only intercept the small set of known OS
+# connectivity-check domains) rather than blanket-redirecting all DNS,
+# to avoid breaking the portal page's own asset loading if it ever
+# references an external domain -- flagged as a refinement, not blocking
+# for a first build since the portal is fully self-hosted with no
+# external assets.
+address=/#/{{GATEWAY_IP}}
