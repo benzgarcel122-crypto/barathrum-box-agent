@@ -29,6 +29,12 @@ DB_PATH = os.path.join(DATA_DIR, "barathrum.sqlite3")
 WAN_IFACE = os.environ.get("BARATHRUM_WAN_IFACE", "eth0")
 LAN_IFACE = os.environ.get("BARATHRUM_LAN_IFACE", "wlan0")
 
+# "onboard_hostapd" (default): box runs its own hostapd directly on a USB WiFi
+# dongle plugged into LAN_IFACE. "external_ap": a dedicated AP device (fed by a
+# wired connection on LAN_IFACE, e.g. via a USB-to-LAN adapter) does the WiFi
+# broadcasting itself -- this box does not run hostapd at all in that mode.
+WIFI_MODE = os.environ.get("BARATHRUM_WIFI_MODE", "onboard_hostapd")
+
 GATEWAY_IP = "10.0.0.1"          # locked Session 28, MPD line ~2154
 DHCP_RANGE_START = "10.0.0.4"    # .1 = gateway, .2/.3 reserved
 DHCP_RANGE_END = "10.0.0.254"
