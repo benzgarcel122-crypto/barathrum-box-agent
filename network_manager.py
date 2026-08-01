@@ -173,21 +173,49 @@ def render_dnsmasq_config():
 
 
 def restart_network_services():
-    _run(["systemctl", "restart", "hostapd"])
+    """
+    dnsmasq (DHCP/DNS) always restarts -- customers still need an IP
+    handed out and DNS resolution regardless of who's broadcasting the
+    radio. hostapd only restarts in "onboard_hostapd" mode; in
+    "external_ap" mode the box has no hostapd of its own to restart --
+    the external AP device handles broadcasting entirely on its own.
+    """
+    if config.WIFI_MODE == "onboard_hostapd":
+        _run(["systemctl", "restart", "hostapd"])
     _run(["systemctl", "restart", "dnsmasq"])
-    logger.info("hostapd + dnsmasq restarted.")
+    logger.info("Network services restarted (WIFI_MODE=%s).", config.WIFI_MODE)
 
 
 def set_customer_wifi(ssid, passphrase):
     """Called from the Setup Wizard and from the admin panel's Settings
-    tab (SSID/password change)."""
+    tab (SSID/password change). In "external_ap" mode this is a no-op --
+    the box has no hostapd to configure; SSID/passphrase must be set on
+    the external AP device directly (e.g. via TP-Link's Omada app),
+    outside this codebase entirely."""
+    if config.WIFI_MODE == "external_ap":
+        logger.info(
+            "WIFI_MODE=external_ap -- skipping hostapd config; SSID/passphrase "
+            "must be set on the external AP device directly, not here."
+        )
+        return
     render_hostapd_config(ssid, passphrase)
     restart_network_services()
 
 
 def broadcast_setup_network(box_mac_suffix):
     """First-boot, no-license-yet state (rule #11): temporary unbranded
-    setup network so the operator can pair the box."""
+    setup network so the operator can pair the box. In "external_ap"
+    mode this is a no-op for the hostapd/SSID-broadcast piece -- the box
+    has no radio to broadcast a setup network on at all. NOTE: how an
+    operator actually performs initial box pairing/setup in
+    "external_ap" mode is a genuinely open design question, not resolved
+    here (see MPD)."""
+    if config.WIFI_MODE == "external_ap":
+        logger.info(
+            "WIFI_MODE=external_ap -- skipping setup-network hostapd broadcast; "
+            "this box has no radio to broadcast a setup SSID on in this mode."
+        )
+        return
     ssid = f"{config.SETUP_SSID_PREFIX}{box_mac_suffix}"
     render_hostapd_config(ssid, passphrase="")  # open network for setup
     render_dnsmasq_config()
