@@ -378,6 +378,139 @@ class HostapdConfigTests(unittest.TestCase):
         self.assertIn("wpa_passphrase=supersecret123", rendered)
 
 
+class WifiModeTests(unittest.TestCase):
+    """
+    Coverage for config.WIFI_MODE ("onboard_hostapd" default vs.
+    "external_ap"). Uses the same DRY_RUN logger-capture pattern as
+    HostapdConfigTests above.
+    """
+
+    def setUp(self):
+        self._tmp_dir = tempfile.mkdtemp(prefix="barathrum-wifimode-test-")
+        config.DATA_DIR = self._tmp_dir
+        self._original_wifi_mode = config.WIFI_MODE
+        network_manager.DRY_RUN = True
+
+    def tearDown(self):
+        config.WIFI_MODE = self._original_wifi_mode
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    def _capture_logs(self):
+        captured = []
+        original_info = network_manager.logger.info
+
+        def _capture(msg, *args):
+            captured.append(msg % args if args else msg)
+            original_info(msg, *args)
+
+        network_manager.logger.info = _capture
+        return captured, original_info
+
+    # --- default mode: behavior must be unchanged -----------------------
+
+    def test_default_wifi_mode_is_onboard_hostapd(self):
+        self.assertEqual(config.WIFI_MODE, "onboard_hostapd")
+
+    def test_onboard_hostapd_restart_still_restarts_hostapd(self):
+        config.WIFI_MODE = "onboard_hostapd"
+        captured, original_info = self._capture_logs()
+        try:
+            network_manager.restart_network_services()
+        finally:
+            network_manager.logger.info = original_info
+        joined = " ".join(captured)
+        self.assertIn("would run: systemctl restart hostapd", joined)
+        self.assertIn("would run: systemctl restart dnsmasq", joined)
+
+    # --- external_ap mode -------------------------------------------------
+
+    def test_external_ap_restart_skips_hostapd_but_restarts_dnsmasq(self):
+        config.WIFI_MODE = "external_ap"
+        captured, original_info = self._capture_logs()
+        try:
+            network_manager.restart_network_services()
+        finally:
+            network_manager.logger.info = original_info
+        joined = " ".join(captured)
+        self.assertNotIn("hostapd", joined)
+        self.assertIn("would run: systemctl restart dnsmasq", joined)
+
+    def test_external_ap_set_customer_wifi_skips_hostapd_render(self):
+        config.WIFI_MODE = "external_ap"
+        original_render = network_manager.render_hostapd_config
+        was_called = {"flag": False}
+
+        def _spy(*args, **kwargs):
+            was_called["flag"] = True
+            return original_render(*args, **kwargs)
+
+        network_manager.render_hostapd_config = _spy
+        captured, original_info = self._capture_logs()
+        try:
+            network_manager.set_customer_wifi("SomeSSID", "somepassphrase")
+        finally:
+            network_manager.render_hostapd_config = original_render
+            network_manager.logger.info = original_info
+
+        self.assertFalse(was_called["flag"])
+        self.assertTrue(any("skipping hostapd config" in line for line in captured))
+
+    def test_external_ap_broadcast_setup_network_skips_hostapd_render(self):
+        config.WIFI_MODE = "external_ap"
+        original_render = network_manager.render_hostapd_config
+        was_called = {"flag": False}
+
+        def _spy(*args, **kwargs):
+            was_called["flag"] = True
+            return original_render(*args, **kwargs)
+
+        network_manager.render_hostapd_config = _spy
+        captured, original_info = self._capture_logs()
+        try:
+            network_manager.broadcast_setup_network("AB12")
+        finally:
+            network_manager.render_hostapd_config = original_render
+            network_manager.logger.info = original_info
+
+        self.assertFalse(was_called["flag"])
+        self.assertTrue(any("skipping setup-network hostapd broadcast" in line for line in captured))
+
+    # --- firewall/grant/revoke: must behave identically in both modes ----
+
+    def _firewall_smoke_test(self):
+        """Runs apply_base_firewall_policy + grant_mac + revoke_mac and
+        returns the list of commands that would have run, via DRY_RUN
+        log capture -- used identically under both WIFI_MODE values."""
+        captured = []
+        original_info = network_manager.logger.info
+
+        def _capture(msg, *args):
+            captured.append(msg % args if args else msg)
+
+        network_manager.logger.info = _capture
+        try:
+            network_manager.apply_base_firewall_policy()
+            network_manager.grant_mac("aa:bb:cc:dd:ee:ff")
+            network_manager.revoke_mac("aa:bb:cc:dd:ee:ff")
+        finally:
+            network_manager.logger.info = original_info
+        return captured
+
+    def test_firewall_functions_identical_in_onboard_hostapd_mode(self):
+        config.WIFI_MODE = "onboard_hostapd"
+        captured = self._firewall_smoke_test()
+        self.assertTrue(any("Base firewall policy applied" in line for line in captured))
+        self.assertTrue(any("Access GRANTED" in line for line in captured))
+        self.assertTrue(any("Access REVOKED" in line for line in captured))
+
+    def test_firewall_functions_identical_in_external_ap_mode(self):
+        config.WIFI_MODE = "external_ap"
+        captured = self._firewall_smoke_test()
+        self.assertTrue(any("Base firewall policy applied" in line for line in captured))
+        self.assertTrue(any("Access GRANTED" in line for line in captured))
+        self.assertTrue(any("Access REVOKED" in line for line in captured))
+
+
 class AdminPanelTests(BoxAgentTestCase):
     def setUp(self):
         super().setUp()
