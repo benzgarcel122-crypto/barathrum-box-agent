@@ -105,3 +105,10 @@ ADMIN_SESSION_COOKIE_NAME = "barathrum_admin_session"
 CUSTOMER_SESSION_COOKIE_NAME = "barathrum_session_token"
 CUSTOMER_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 90  # 90 days; long-lived
                                                        # by design, per rule #1
+
+# Admin login brute-force lockout (STEP 1 tracker row 25). Single global admin credential per
+# box -- unlike OTPCode centrally (many codes/phone numbers at once), there is exactly one admin
+# password per box, so a single persistent counter is the correct match here, not anything
+# per-IP or per-session.
+ADMIN_LOGIN_MAX_FAILED_ATTEMPTS = 5   # same number OTPCode already uses centrally, for consistency
+ADMIN_LOGIN_LOCKOUT_SECONDS = 300     # 5 minutes; PM can tune this, not fixed in stone
