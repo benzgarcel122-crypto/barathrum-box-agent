@@ -65,6 +65,12 @@ CFG_CUSTOMER_WIFI_PASSWORD = "customer_wifi_password"
 CFG_ADMIN_PASSWORD_HASH = "admin_password_hash"
 CFG_LICENSE_KEY = "license_key"
 CFG_SETUP_COMPLETE = "setup_complete"  # "1" once Setup Wizard has run
+# Admin login brute-force lockout (STEP 1 tracker row 25). Persisted here rather than held in
+# memory, same reasoning as everything else in this table -- an in-memory-only counter would
+# reset on every box reboot, defeating the point (an attacker could just force/wait for a reboot
+# to reset their attempt budget).
+CFG_ADMIN_LOGIN_FAILED_ATTEMPTS = "admin_login_failed_attempts"
+CFG_ADMIN_LOGIN_LOCKED_UNTIL = "admin_login_locked_until"  # unix timestamp, empty/absent = not locked
 
 
 def get_connection():
