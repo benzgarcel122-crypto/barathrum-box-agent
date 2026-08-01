@@ -545,5 +545,94 @@ class AdminPanelTests(BoxAgentTestCase):
         self.assertEqual(revoked["remaining_seconds"], 0)
 
 
+class AdminLoginLockoutTests(BoxAgentTestCase):
+    """STEP 1 tracker row 25 -- brute-force lockout on the local admin login."""
+
+    def setUp(self):
+        super().setUp()
+        from werkzeug.security import generate_password_hash
+        db.set_config(db.CFG_ADMIN_PASSWORD_HASH, generate_password_hash("adminpass123"))
+
+    def _fail_login(self):
+        return self.client.post("/admin/login", data={"password": "wrong"})
+
+    def test_correct_password_first_try_counter_stays_zero(self):
+        resp = self.client.post(
+            "/admin/login", data={"password": "adminpass123"}, follow_redirects=True
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(db.CFG_ADMIN_LOGIN_FAILED_ATTEMPTS), "0")
+
+    def test_single_wrong_password_increments_counter_no_lockout_yet(self):
+        resp = self._fail_login()
+        self.assertIn(b"Incorrect password", resp.data)
+        self.assertNotIn(b"Too many failed attempts", resp.data)
+        self.assertEqual(db.get_config(db.CFG_ADMIN_LOGIN_FAILED_ATTEMPTS), "1")
+        self.assertFalse(db.get_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL))
+
+    def test_max_failed_attempts_triggers_lockout_and_resets_counter(self):
+        for _ in range(config.ADMIN_LOGIN_MAX_FAILED_ATTEMPTS - 1):
+            resp = self._fail_login()
+            self.assertIn(b"Incorrect password", resp.data)
+
+        # the attempt that crosses the threshold
+        resp = self._fail_login()
+        self.assertIn(b"Too many failed attempts", resp.data)
+        self.assertEqual(db.get_config(db.CFG_ADMIN_LOGIN_FAILED_ATTEMPTS), "0")
+        locked_until = db.get_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL)
+        self.assertTrue(locked_until)
+        self.assertGreater(float(locked_until), time.time())
+
+    def test_correct_password_rejected_while_locked(self):
+        """Confirms the lockout check runs BEFORE the password check, not after --
+        the right password must not succeed during an active lockout window."""
+        for _ in range(config.ADMIN_LOGIN_MAX_FAILED_ATTEMPTS):
+            self._fail_login()
+
+        resp = self.client.post("/admin/login", data={"password": "adminpass123"})
+        self.assertIn(b"Too many failed attempts", resp.data)
+        # still not authenticated -- confirm no session was granted
+        home_resp = self.client.get("/admin")
+        self.assertEqual(home_resp.status_code, 302)
+        self.assertIn("/admin/login", home_resp.headers["Location"])
+
+    def test_login_works_again_after_lockout_window_passes(self):
+        for _ in range(config.ADMIN_LOGIN_MAX_FAILED_ATTEMPTS):
+            self._fail_login()
+        self.assertTrue(db.get_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL))
+
+        # Backdate CFG_ADMIN_LOGIN_LOCKED_UNTIL into the past rather than sleeping in the test,
+        # same pattern SessionPauseResumeTests.test_30_day_abandonment_forfeits_balance uses for
+        # paused_at.
+        db.set_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL, str(time.time() - 1))
+
+        resp = self.client.post(
+            "/admin/login", data={"password": "adminpass123"}, follow_redirects=True
+        )
+        self.assertEqual(resp.status_code, 200)
+        home_resp = self.client.get("/admin")
+        self.assertEqual(home_resp.status_code, 200)
+
+    def test_lockout_state_survives_a_fresh_app_context_reset(self):
+        """Confirms the counter is read from the real config table, not an in-memory
+        variable that would silently reset -- the whole point of this task."""
+        for _ in range(config.ADMIN_LOGIN_MAX_FAILED_ATTEMPTS):
+            self._fail_login()
+        locked_until_before = db.get_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL)
+        self.assertTrue(locked_until_before)
+
+        # Fresh CoinAcceptor + fresh Flask test client, same DB file -- mirrors what a real
+        # process restart looks like from the app's own perspective, without tearing down the
+        # SQLite file this test's config lives in.
+        self.acceptor.disarm()
+        self.acceptor = CoinAcceptor(on_coin=self._on_coin)
+        portal_app.attach_coin_acceptor(self.acceptor)
+        self.client = portal_app.app.test_client()
+
+        resp = self.client.post("/admin/login", data={"password": "adminpass123"})
+        self.assertIn(b"Too many failed attempts", resp.data)
+        self.assertEqual(db.get_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL), locked_until_before)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
