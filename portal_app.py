@@ -198,13 +198,41 @@ def admin_login_required(view):
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     error = None
+
+    # Lockout check runs BEFORE anything else -- including before even looking at a submitted
+    # password on POST -- deliberately, so a locked-out attacker gets zero additional
+    # check_password_hash attempts during the window, not just a "you're locked" message tacked
+    # onto a failed check.
+    locked_until = db.get_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL)
+    now = time.time()
+    if locked_until and float(locked_until) > now:
+        remaining = int(float(locked_until) - now)
+        error = f"Too many failed attempts. Try again in {remaining} seconds."
+        return render_template("admin_login.html", error=error)
+
     if request.method == "POST":
         password = request.form.get("password", "")
         stored_hash = db.get_config(db.CFG_ADMIN_PASSWORD_HASH)
         if stored_hash and check_password_hash(stored_hash, password):
             flask_session["admin_authenticated"] = True
+            db.set_config(db.CFG_ADMIN_LOGIN_FAILED_ATTEMPTS, "0")
+            db.set_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL, "")
             return redirect(url_for("admin_home"))
-        error = "Incorrect password."
+
+        failed = int(db.get_config(db.CFG_ADMIN_LOGIN_FAILED_ATTEMPTS) or 0) + 1
+        db.set_config(db.CFG_ADMIN_LOGIN_FAILED_ATTEMPTS, str(failed))
+        if failed >= config.ADMIN_LOGIN_MAX_FAILED_ATTEMPTS:
+            db.set_config(
+                db.CFG_ADMIN_LOGIN_LOCKED_UNTIL, str(now + config.ADMIN_LOGIN_LOCKOUT_SECONDS)
+            )
+            db.set_config(db.CFG_ADMIN_LOGIN_FAILED_ATTEMPTS, "0")  # fresh counter after a lockout
+            error = (
+                f"Too many failed attempts. Try again in "
+                f"{config.ADMIN_LOGIN_LOCKOUT_SECONDS} seconds."
+            )
+        else:
+            error = "Incorrect password."
+
     return render_template("admin_login.html", error=error)
 
 
