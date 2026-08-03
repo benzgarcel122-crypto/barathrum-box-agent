@@ -22,6 +22,9 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
+
+import requests
 
 os.environ.setdefault("BARATHRUM_DRY_RUN", "1")
 
@@ -286,11 +289,48 @@ class SetupWizardTests(BoxAgentTestCase):
         self.assertIn("/setup", resp.headers["Location"])
 
     def test_screen1_rejects_empty_license_key(self):
-        resp = self.client.post("/setup", data={"step": "1", "license_key": ""})
+        # No HTTP call should happen at all -- caught client-side before
+        # requests.post is ever reached.
+        with patch("portal_app.requests.post") as mock_post:
+            resp = self.client.post("/setup", data={"step": "1", "license_key": ""})
+            mock_post.assert_not_called()
         self.assertIn(b"Enter your license key", resp.data)
 
+    def test_screen1_accepts_real_valid_license_key(self):
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": True, "message": "License validated.",
+            }
+            resp = self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+        self.assertEqual(resp.status_code, 200)
+        mock_post.assert_called_once()
+        called_url = mock_post.call_args.args[0]
+        self.assertTrue(called_url.endswith("/api/box/validate-license/"))
+        self.assertEqual(mock_post.call_args.kwargs["json"], {"license_key": "TESTKEY123"})
+        self.assertEqual(mock_post.call_args.kwargs["timeout"], 10)
+
+    def test_screen1_rejects_nonexistent_license_key(self):
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": False, "message": "License key not recognized.",
+            }
+            resp = self.client.post("/setup", data={"step": "1", "license_key": "NOSUCHKEY"})
+        self.assertIn(b"License key not recognized.", resp.data)
+
+    def test_screen1_network_failure_shows_generic_error_and_does_not_proceed(self):
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.side_effect = requests.exceptions.ConnectionError("no route to host")
+            resp = self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+        self.assertIn(b"Could not reach the license server", resp.data)
+        with self.client.session_transaction() as sess:
+            self.assertNotIn("setup_license_key", sess)
+
     def test_full_wizard_flow_completes_and_sets_config(self):
-        resp = self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": True, "message": "License validated.",
+            }
+            resp = self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
         self.assertEqual(resp.status_code, 200)
 
         resp = self.client.post(
@@ -308,7 +348,11 @@ class SetupWizardTests(BoxAgentTestCase):
         self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "TESTKEY123")
 
     def test_mismatched_passwords_rejected(self):
-        self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": True, "message": "License validated.",
+            }
+            self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
         resp = self.client.post(
             "/setup",
             data={
