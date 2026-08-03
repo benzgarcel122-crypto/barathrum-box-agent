@@ -22,6 +22,7 @@ import subprocess
 import time
 from functools import wraps
 
+import requests
 from flask import Flask, jsonify, redirect, render_template, request, session as flask_session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -316,11 +317,13 @@ def setup_wizard():
     after a reflash), so it doesn't need the same polish/state-machine
     rigor as the customer portal.
 
-    NOTE: screen 2's license validation against the cloud dashboard is
-    STUBBED here -- as of Session 60, the Django backend has no exposed
-    box-pairing/license-validation endpoint yet (confirmed by direct
-    repo inspection, no machines/urls.py exists). This is a real,
-    separate open item for the cloud side -- see README.md.
+    NOTE: screen 1's license key is now validated for real against the
+    cloud dashboard's POST {DASHBOARD_API_BASE_URL}/api/box/validate-license/
+    endpoint (live since Session 63, current contract as of Session 86).
+    No CSRF token is sent -- the endpoint is csrf_exempt server-side. A
+    network-level failure (timeout, connection error, non-JSON response)
+    fails closed: Screen 1 re-renders with a generic error and setup does
+    not proceed.
     """
     step = request.form.get("step", "1")
 
@@ -328,10 +331,29 @@ def setup_wizard():
         license_key = request.form.get("license_key", "").strip()
         if not license_key:
             return render_template("setup.html", step=1, error="Enter your license key.")
-        # STUB: real validation call to DASHBOARD_API_BASE_URL goes here
-        # once the backend endpoint exists. For now, accept any non-empty
-        # key so the rest of the wizard flow (screens 2-4) can be built
-        # and tested end-to-end ahead of that backend work.
+        try:
+            resp = requests.post(
+                f"{config.DASHBOARD_API_BASE_URL}/api/box/validate-license/",
+                json={"license_key": license_key},
+                timeout=10,
+            )
+            data = resp.json()
+        except (requests.exceptions.RequestException, ValueError):
+            # Fail closed: a network-level failure or a non-JSON response
+            # must not be treated as an accepted key. One attempt per form
+            # submission -- the operator resubmitting is the retry
+            # mechanism, no automatic retry loop here.
+            return render_template(
+                "setup.html", step=1,
+                error="Could not reach the license server. Check your internet connection and try again.",
+            )
+
+        if not data.get("valid"):
+            return render_template(
+                "setup.html", step=1,
+                error=data.get("message", "License key not recognized."),
+            )
+
         flask_session["setup_license_key"] = license_key
         return render_template("setup.html", step=2)
 
