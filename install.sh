@@ -43,6 +43,26 @@ SERVICE_NAME="barathrum-agent.service"
 SERVICE_SRC="${INSTALL_DIR}/systemd/${SERVICE_NAME}"
 SERVICE_DST="/etc/systemd/system/${SERVICE_NAME}"
 
+# Pinned release tag this script installs. Never tracks a branch (main can
+# carry untested/in-progress work indefinitely) -- only a tagged GitHub
+# Release is vouched-for as ready for a real operator's box. Updated as the
+# literal last step of finalizing each release, per the RELEASE RITUAL
+# (see MPD, Session 88 PM decisions / tracker row 26).
+INSTALL_TAG="v1.0.0"
+
+# Resolved commit SHA of INSTALL_TAG at release-cut time -- this is what actually gets checked
+# out/reset to, not the tag name itself (Security Findings Tracker #14 / tracker row 27: a git
+# tag is mutable and can be force-moved after the fact by anyone with repo/release write access;
+# a commit SHA cannot be). INSTALL_TAG above is kept purely as the human-readable release label
+# for log output from here on -- it no longer drives any git operation.
+#
+# REPLACE_AT_RELEASE_CUT is a deliberate placeholder. require_real_commit_pin() below refuses to
+# run against this value, so an unfinished release can never be accidentally installed on a real
+# box. This gets filled in for real as the literal last step of the RELEASE RITUAL, by resolving
+# `git rev-parse v1.0.0` against the tagged commit once it's actually pushed to GitHub, and
+# pasting that 40-character SHA in here.
+INSTALL_COMMIT_SHA="REPLACE_AT_RELEASE_CUT"
+
 # --- Helpers ----------------------------------------------------------------
 
 log() {
@@ -57,6 +77,20 @@ fail() {
 require_root() {
     if [[ "${EUID}" -ne 0 ]]; then
         fail "must be run as root (e.g. sudo ./install.sh)."
+    fi
+}
+
+require_real_commit_pin() {
+    if [[ "${INSTALL_COMMIT_SHA}" == "REPLACE_AT_RELEASE_CUT" ]]; then
+        fail "INSTALL_COMMIT_SHA is still the placeholder value (REPLACE_AT_RELEASE_CUT) -- no" \
+             "real release has been cut for this script yet. Do not run this against a real box." \
+             "See the MPD's RELEASE RITUAL for the release-cutting steps that fill this in for real."
+    fi
+    if [[ ! "${INSTALL_COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+        fail "INSTALL_COMMIT_SHA ('${INSTALL_COMMIT_SHA}') is not a well-formed 40-character" \
+             "lowercase hex commit SHA. Check for a truncated paste, a stray space/newline, or" \
+             "accidentally pasting the tag name instead of its resolved commit -- run" \
+             "'git rev-parse v1.0.0' against the tagged commit to get the correct value."
     fi
 }
 
@@ -124,24 +158,36 @@ step_install_dependencies() {
 }
 
 step_clone_or_update_repo() {
-    log "Step 3/7: cloning/updating ${REPO_URL} into ${INSTALL_DIR}"
+    log "Step 3/7: cloning/updating ${REPO_URL} into ${INSTALL_DIR}, pinned to release ${INSTALL_TAG} (commit ${INSTALL_COMMIT_SHA})"
 
     if [[ -d "${INSTALL_DIR}/.git" ]]; then
-        log "${INSTALL_DIR} already a git checkout — fetching and resetting to origin."
-        git -C "${INSTALL_DIR}" fetch origin || fail "git fetch failed in ${INSTALL_DIR}."
-        # Determine origin's default branch rather than assuming 'main'.
-        local default_branch
-        default_branch=$(git -C "${INSTALL_DIR}" remote show origin 2>/dev/null \
-            | sed -n '/HEAD branch/s/.*: //p')
-        default_branch="${default_branch:-main}"
-        git -C "${INSTALL_DIR}" checkout "${default_branch}" || fail "git checkout ${default_branch} failed."
-        git -C "${INSTALL_DIR}" reset --hard "origin/${default_branch}" \
-            || fail "git reset --hard failed in ${INSTALL_DIR}."
+        local current_origin
+        current_origin=$(git -C "${INSTALL_DIR}" remote get-url origin 2>/dev/null || echo "")
+        if [[ "${current_origin}" != "${REPO_URL}" ]]; then
+            fail "${INSTALL_DIR}'s origin remote ('${current_origin:-<none>}') does not match the" \
+                 "expected REPO_URL ('${REPO_URL}') -- refusing to fetch/reset from an unexpected" \
+                 "remote. If this is intentional, resolve it manually before re-running this script."
+        fi
+
+        log "${INSTALL_DIR} already a git checkout — fetching tags and resetting to ${INSTALL_TAG} (${INSTALL_COMMIT_SHA})."
+        git -C "${INSTALL_DIR}" fetch --tags origin || fail "git fetch --tags failed in ${INSTALL_DIR}."
+        git -C "${INSTALL_DIR}" checkout "${INSTALL_COMMIT_SHA}" \
+            || fail "git checkout ${INSTALL_COMMIT_SHA} failed -- is this commit reachable on" \
+                    "origin? Run: git ls-remote ${REPO_URL} refs/tags/${INSTALL_TAG} to see what" \
+                    "commit the ${INSTALL_TAG} tag currently points to, and confirm it matches" \
+                    "INSTALL_COMMIT_SHA in this script."
+        git -C "${INSTALL_DIR}" reset --hard "${INSTALL_COMMIT_SHA}" \
+            || fail "git reset --hard ${INSTALL_COMMIT_SHA} failed in ${INSTALL_DIR}."
     elif [[ -d "${INSTALL_DIR}" ]]; then
         fail "${INSTALL_DIR} exists but is not a git checkout. Refusing to overwrite" \
              "a directory this script doesn't recognize — inspect it manually first."
     else
         git clone "${REPO_URL}" "${INSTALL_DIR}" || fail "git clone failed."
+        git -C "${INSTALL_DIR}" checkout "${INSTALL_COMMIT_SHA}" \
+            || fail "git checkout ${INSTALL_COMMIT_SHA} failed -- is this commit reachable on" \
+                    "origin? Run: git ls-remote ${REPO_URL} refs/tags/${INSTALL_TAG} to see what" \
+                    "commit the ${INSTALL_TAG} tag currently points to, and confirm it matches" \
+                    "INSTALL_COMMIT_SHA in this script."
     fi
 }
 
@@ -234,6 +280,7 @@ EOF
 # --- Main -----------------------------------------------------------------
 
 main() {
+    require_real_commit_pin
     require_root
     step_apt_update
     step_install_dependencies
