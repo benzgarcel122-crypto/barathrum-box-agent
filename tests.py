@@ -19,6 +19,7 @@ Run with:
 
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -676,6 +677,266 @@ class AdminLoginLockoutTests(BoxAgentTestCase):
         resp = self.client.post("/admin/login", data={"password": "adminpass123"})
         self.assertIn(b"Too many failed attempts", resp.data)
         self.assertEqual(db.get_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL), locked_until_before)
+
+
+class InstallScriptTagPinningTests(unittest.TestCase):
+    """Session 88 + Session 90 (Security Findings #14/#15, tracker row 27):
+    install.sh must pin step_clone_or_update_repo() to the immutable
+    INSTALL_COMMIT_SHA -- never a mutable tag name, never a branch -- and
+    must verify an already-cloned directory's origin remote before any
+    fetch/reset. These tests exercise the real function against a real
+    local throwaway git remote -- not a mock of git commands -- so they
+    genuinely prove a force-moved tag or a repointed origin can't silently
+    change what gets installed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "install.sh")
+        with open(cls.script_path) as f:
+            cls.script_source = f.read()
+
+    def _run(self, *args, cwd=None):
+        return subprocess.run(list(args), check=True, capture_output=True, text=True, cwd=cwd)
+
+    def _rev_parse(self, repo_dir, ref):
+        return self._run("git", "-C", repo_dir, "rev-parse", ref).stdout.strip()
+
+    def _no_main_source(self):
+        # Strip the trailing `main "$@"` invocation so the script's real
+        # functions and Config section can be sourced without triggering
+        # the apt/systemd install steps (which need root and a real box).
+        lines = self.script_source.splitlines()
+        return "\n".join(l for l in lines if l.strip() != 'main "$@"')
+
+    def _sourced_script_path(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as tf:
+            tf.write(self._no_main_source())
+            return tf.name
+
+    def _run_clone_step(self, repo_url, install_dir, install_tag="v1.0.0", install_commit_sha=None):
+        sourced_path = self._sourced_script_path()
+        try:
+            bash_cmd = f'source "{sourced_path}"; REPO_URL="{repo_url}"; INSTALL_DIR="{install_dir}"; INSTALL_TAG="{install_tag}"; '
+            if install_commit_sha is not None:
+                bash_cmd += f'INSTALL_COMMIT_SHA="{install_commit_sha}"; '
+            bash_cmd += "step_clone_or_update_repo"
+            return subprocess.run(["bash", "-c", bash_cmd], capture_output=True, text=True)
+        finally:
+            os.unlink(sourced_path)
+
+    def _run_require_real_commit_pin(self, install_commit_sha=None):
+        sourced_path = self._sourced_script_path()
+        try:
+            bash_cmd = f'source "{sourced_path}"; '
+            if install_commit_sha is not None:
+                bash_cmd += f'INSTALL_COMMIT_SHA="{install_commit_sha}"; '
+            bash_cmd += "require_real_commit_pin"
+            return subprocess.run(["bash", "-c", bash_cmd], capture_output=True, text=True)
+        finally:
+            os.unlink(sourced_path)
+
+    def _make_remote_with_tagged_and_untested_commits(self, tmp, remote_name="remote.git"):
+        """Returns (remote_path, work_dir, tagged_commit_sha)."""
+        remote = os.path.join(tmp, remote_name)
+        self._run("git", "init", "--bare", "-b", "main", remote)
+        work = os.path.join(tmp, remote_name.replace(".git", "") + "-work")
+        self._run("git", "clone", remote, work)
+        self._run("git", "-C", work, "config", "user.email", "t@example.com")
+        self._run("git", "-C", work, "config", "user.name", "Test")
+        with open(os.path.join(work, "f.txt"), "w") as f:
+            f.write("v1 -- tagged release\n")
+        self._run("git", "-C", work, "add", "f.txt")
+        self._run("git", "-C", work, "commit", "-m", "v1")
+        self._run("git", "-C", work, "tag", "v1.0.0")
+        tagged_sha = self._rev_parse(work, "v1.0.0")
+        with open(os.path.join(work, "f.txt"), "w") as f:
+            f.write("v2 -- untested, still on main only\n")
+        self._run("git", "-C", work, "add", "f.txt")
+        self._run("git", "-C", work, "commit", "-m", "v2 untested")
+        self._run("git", "-C", work, "push", "origin", "main")
+        self._run("git", "-C", work, "push", "origin", "v1.0.0")
+        return remote, work, tagged_sha
+
+    # -- static source checks -------------------------------------------
+
+    def test_default_branch_detection_removed(self):
+        self.assertNotIn("default_branch", self.script_source)
+
+    def test_install_tag_constant_present(self):
+        self.assertIn('INSTALL_TAG="v1.0.0"', self.script_source)
+
+    def test_install_commit_sha_placeholder_shipped(self):
+        self.assertIn('INSTALL_COMMIT_SHA="REPLACE_AT_RELEASE_CUT"', self.script_source)
+
+    # -- test 1/2: require_real_commit_pin guard -------------------------
+
+    def test_1_guard_fires_on_shipped_placeholder(self):
+        result = self._run_require_real_commit_pin()  # leave at real shipped default
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("REPLACE_AT_RELEASE_CUT", result.stderr)
+        self.assertIn("RELEASE RITUAL", result.stderr)
+
+    def test_2_guard_passes_for_real_looking_sha(self):
+        result = self._run_require_real_commit_pin(install_commit_sha="a" * 40)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.strip(), "")
+
+    def test_guard_rejects_too_short_hex_string(self):
+        bad_value = "a" * 10
+        result = self._run_require_real_commit_pin(install_commit_sha=bad_value)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(bad_value, result.stderr)
+        self.assertIn("40-character", result.stderr)
+
+    def test_guard_rejects_too_long_hex_string(self):
+        bad_value = "a" * 50
+        result = self._run_require_real_commit_pin(install_commit_sha=bad_value)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(bad_value, result.stderr)
+        self.assertIn("40-character", result.stderr)
+
+    def test_guard_rejects_uppercase_hex(self):
+        bad_value = "A" * 40
+        result = self._run_require_real_commit_pin(install_commit_sha=bad_value)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(bad_value, result.stderr)
+
+    def test_guard_rejects_tag_name_pasted_instead_of_sha(self):
+        result = self._run_require_real_commit_pin(install_commit_sha="v1.0.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("v1.0.0", result.stderr)
+        self.assertIn("git rev-parse", result.stderr)
+
+    def test_guard_rejects_trailing_whitespace_copy_paste_artifact(self):
+        bad_value = ("a" * 40) + "\n"
+        result = self._run_require_real_commit_pin(install_commit_sha=bad_value)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("40-character", result.stderr)
+
+    # -- test 3/4: SHA pinning behaves like tag pinning did --------------
+
+    def test_3_fresh_clone_checks_out_pinned_sha_not_untested_main_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote, _work, tagged_sha = self._make_remote_with_tagged_and_untested_commits(tmp)
+            install_dir = os.path.join(tmp, "installed")
+            result = self._run_clone_step(remote, install_dir, install_commit_sha=tagged_sha)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(os.path.join(install_dir, "f.txt")) as f:
+                content = f.read()
+            self.assertIn("v1 -- tagged release", content)
+            self.assertNotIn("untested", content)
+
+    def test_4_already_cloned_directory_resets_to_pinned_sha(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote, _work, tagged_sha = self._make_remote_with_tagged_and_untested_commits(tmp)
+            install_dir = os.path.join(tmp, "installed")
+            # Simulate a box already checked out to the untested main HEAD.
+            self._run("git", "clone", remote, install_dir)
+            self._run("git", "-C", install_dir, "checkout", "main")
+            result = self._run_clone_step(remote, install_dir, install_commit_sha=tagged_sha)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(os.path.join(install_dir, "f.txt")) as f:
+                content = f.read()
+            self.assertIn("v1 -- tagged release", content)
+            self.assertNotIn("untested", content)
+
+    # -- test 5: the money test -- force-moving the tag changes nothing --
+
+    def test_5_force_moved_tag_does_not_change_what_gets_installed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote, work, tagged_sha = self._make_remote_with_tagged_and_untested_commits(tmp)
+            # Simulate a compromised release: push a third commit and force-move
+            # v1.0.0 to point at it, exactly as an attacker with repo/release
+            # write access could.
+            with open(os.path.join(work, "f.txt"), "w") as f:
+                f.write("v3 -- MALICIOUS, tag force-moved here\n")
+            self._run("git", "-C", work, "add", "f.txt")
+            self._run("git", "-C", work, "commit", "-m", "v3 malicious")
+            self._run("git", "-C", work, "push", "origin", "main")
+            self._run("git", "-C", work, "tag", "-f", "v1.0.0")
+            self._run("git", "-C", work, "push", "origin", "v1.0.0", "--force")
+
+            # Confirm the tag really did move on the remote, so this test would
+            # actually catch a regression rather than passing vacuously.
+            moved_sha = self._rev_parse(work, "v1.0.0")
+            self.assertNotEqual(moved_sha, tagged_sha)
+
+            install_dir = os.path.join(tmp, "installed")
+            # Pin to the ORIGINAL captured SHA -- not re-resolved from the tag.
+            result = self._run_clone_step(remote, install_dir, install_commit_sha=tagged_sha)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(os.path.join(install_dir, "f.txt")) as f:
+                content = f.read()
+            self.assertIn("v1 -- tagged release", content)
+            self.assertNotIn("MALICIOUS", content)
+
+    # -- test 6: idempotency ----------------------------------------------
+
+    def test_6_rerun_against_already_pinned_directory_is_idempotent_no_op(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote, _work, tagged_sha = self._make_remote_with_tagged_and_untested_commits(tmp)
+            install_dir = os.path.join(tmp, "installed")
+            first = self._run_clone_step(remote, install_dir, install_commit_sha=tagged_sha)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            second = self._run_clone_step(remote, install_dir, install_commit_sha=tagged_sha)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            with open(os.path.join(install_dir, "f.txt")) as f:
+                content = f.read()
+            self.assertIn("v1 -- tagged release", content)
+
+    # -- test 7: nonexistent SHA fails loudly ------------------------------
+
+    def test_7_nonexistent_sha_fails_loudly_naming_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote, _work, _tagged_sha = self._make_remote_with_tagged_and_untested_commits(tmp)
+            install_dir = os.path.join(tmp, "installed")
+            bogus_sha = "f" * 40
+            result = self._run_clone_step(remote, install_dir, install_commit_sha=bogus_sha)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(bogus_sha, result.stderr)
+            self.assertIn("git ls-remote", result.stderr)
+
+    # -- test 8/9: origin verification --------------------------------------
+
+    def test_8_origin_mismatch_rejected_before_any_fetch_or_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote_real, _work_real, tagged_sha = self._make_remote_with_tagged_and_untested_commits(
+                tmp, remote_name="remote-real.git"
+            )
+            remote_other, _work_other, _other_sha = self._make_remote_with_tagged_and_untested_commits(
+                tmp, remote_name="remote-other.git"
+            )
+            install_dir = os.path.join(tmp, "installed")
+            # Box was cloned from (or repointed to, by a prior compromise) the
+            # WRONG remote.
+            self._run("git", "clone", remote_other, install_dir)
+            with open(os.path.join(install_dir, "f.txt")) as f:
+                before_content = f.read()
+
+            result = self._run_clone_step(remote_real, install_dir, install_commit_sha=tagged_sha)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(remote_other, result.stderr)
+            self.assertIn(remote_real, result.stderr)
+            # No fetch/reset happened -- working tree is byte-identical to
+            # before the call, proving the check runs before any git network
+            # operation, not merely that a later step also happened to fail.
+            with open(os.path.join(install_dir, "f.txt")) as f:
+                after_content = f.read()
+            self.assertEqual(before_content, after_content)
+
+    def test_9_origin_match_still_succeeds_normally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            remote, _work, tagged_sha = self._make_remote_with_tagged_and_untested_commits(tmp)
+            install_dir = os.path.join(tmp, "installed")
+            self._run("git", "clone", remote, install_dir)
+            self._run("git", "-C", install_dir, "checkout", "main")
+            result = self._run_clone_step(remote, install_dir, install_commit_sha=tagged_sha)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(os.path.join(install_dir, "f.txt")) as f:
+                content = f.read()
+            self.assertIn("v1 -- tagged release", content)
+            self.assertNotIn("untested", content)
 
 
 if __name__ == "__main__":
