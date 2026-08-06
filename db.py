@@ -48,6 +48,17 @@ CREATE TABLE IF NOT EXISTS transactions (
     timestamp REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS vouchers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    minutes INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    redeemed_at REAL,                -- NULL until redeemed
+    redeemed_by_mac TEXT,
+    redeemed_session_token TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_vouchers_code ON vouchers(code);
+
 CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -240,3 +251,51 @@ def get_todays_earnings_pesos():
             (midnight,),
         ).fetchone()
         return row["total"]
+
+
+# --- vouchers (item 10) -----------------------------------------------------
+
+def create_voucher(code, minutes):
+    """Raises sqlite3.IntegrityError if code already exists -- caller
+    (portal_app.py's admin route) is responsible for retrying with a
+    fresh code on collision."""
+    with cursor() as cur:
+        cur.execute(
+            "INSERT INTO vouchers (code, minutes, created_at) VALUES (?, ?, ?)",
+            (code, minutes, time.time()),
+        )
+
+
+def get_voucher_by_code(code):
+    with cursor() as cur:
+        row = cur.execute(
+            "SELECT * FROM vouchers WHERE code = ?", (code,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def redeem_voucher(code, mac_address, session_token):
+    """
+    Atomic redeem: the WHERE redeemed_at IS NULL clause means this can
+    only ever succeed once for a given code, even under a race between
+    two near-simultaneous redemption attempts -- the second call's
+    UPDATE simply matches zero rows. Returns True if THIS call was the
+    one that redeemed it, False if it was already redeemed (by a prior
+    call or this same race).
+    """
+    with cursor() as cur:
+        cur.execute(
+            "UPDATE vouchers SET redeemed_at = ?, redeemed_by_mac = ?, "
+            "redeemed_session_token = ? WHERE code = ? AND redeemed_at IS NULL",
+            (time.time(), mac_address, session_token, code),
+        )
+        return cur.rowcount == 1
+
+
+def get_all_vouchers():
+    """Newest first -- used by the admin Vouchers page."""
+    with cursor() as cur:
+        rows = cur.execute(
+            "SELECT * FROM vouchers ORDER BY created_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
