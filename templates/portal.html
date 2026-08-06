@@ -79,6 +79,15 @@
   <div class="hint" id="armed-hint" style="display:none;">
     Coin acceptor is ready — insert your coin(s) now.
   </div>
+
+  <div id="voucher-toggle-area">
+    <a href="#" onclick="toggleVoucherForm(); return false;" style="color: var(--muted); font-size: 13px; text-decoration: underline;">Insert Voucher</a>
+    <div id="voucher-form" style="display:none; margin-top: 12px;">
+      <input type="text" id="voucher-code-input" placeholder="Voucher code" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid #2a2f3a; background:#0f1115; color:var(--text); font-size:14px; text-transform:uppercase;">
+      <button class="btn-secondary" onclick="redeemVoucher()">Redeem</button>
+      <div id="voucher-error" style="color: var(--danger); font-size: 12px; margin-top: 6px;"></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -101,6 +110,30 @@ async function pauseSession() {
 
 async function resumeSession() {
   await fetch('/api/session/resume', { method: 'POST' });
+  poll();
+}
+
+function toggleVoucherForm() {
+  const form = document.getElementById('voucher-form');
+  form.style.display = form.style.display === 'none' ? 'block' : 'none';
+}
+
+async function redeemVoucher() {
+  const input = document.getElementById('voucher-code-input');
+  const errorEl = document.getElementById('voucher-error');
+  errorEl.textContent = '';
+  const resp = await fetch('/api/insert-voucher', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'voucher_code=' + encodeURIComponent(input.value),
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    errorEl.textContent = data.error || 'Something went wrong.';
+    return;
+  }
+  input.value = '';
+  document.getElementById('voucher-form').style.display = 'none';
   poll();
 }
 
