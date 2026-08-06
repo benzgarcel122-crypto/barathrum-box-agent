@@ -21,13 +21,13 @@
     </form>
 
   {% elif step == 2 %}
-    <p class="hint">Step 2 of 4 — Set up your customer-facing WiFi and admin password.</p>
+    <p class="hint">Step 2 of 4 — Create your admin account, and set your customer-facing WiFi name.</p>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     <form method="post">
       <input type="hidden" name="step" value="2">
       <label>Customer WiFi network name (SSID)</label>
       <input type="text" name="customer_ssid" required>
-      <label>Admin password</label>
+      <label>Create admin password</label>
       <input type="password" name="admin_password" required>
       <label>Confirm admin password</label>
       <input type="password" name="confirm_password" required>
@@ -43,7 +43,7 @@
     </form>
 
   {% elif step == 4 %}
-    <p class="hint">Step 4 of 4 — Rebooting onto your live network. This box is ready.</p>
+    <p class="hint">Step 4 of 4 — Rebooting onto your live network. Once it's back online, log in to the admin panel using the account you just created.</p>
   {% endif %}
 </div>
 
@@ -54,7 +54,7 @@ async function submitReboot() {
   body.set('customer_wifi_password', password);
   await fetch('/setup/reboot', { method: 'POST', body });
   document.querySelector('.admin-card').innerHTML =
-    '<h1>Barathrum Setup</h1><p class="hint">Step 4 of 4 — Rebooting onto your live network. This box is ready.</p>';
+    '<h1>Barathrum Setup</h1><p class="hint">Step 4 of 4 — Rebooting onto your live network. Once it\'s back online, log in to the admin panel using the account you just created.</p>';
 }
 </script>
 </body>
