@@ -60,15 +60,13 @@
     {% elif session.status == 'paused' %}
       <div class="timer">{{ (session.remaining_seconds // 60) }}:{{ '%02d' % (session.remaining_seconds % 60) }}</div>
       <div class="subtext">Session paused. Your time is saved.</div>
-      <button class="btn-primary" onclick="resumeSession()">Resume</button>
       <button class="btn-secondary" onclick="armCoinAcceptor()">Insert Coin</button>
+      <button class="btn-primary" onclick="resumeSession()">Resume</button>
     {% elif session.status == 'active' %}
       <div class="timer" id="active-timer">{{ (session.remaining_seconds // 60) }}:{{ '%02d' % (session.remaining_seconds % 60) }}</div>
       <div class="subtext">Connected. Enjoy!</div>
-      <div class="row">
-        <button class="btn-secondary" onclick="armCoinAcceptor()">Insert More Coins</button>
-        <button class="btn-secondary" onclick="pauseSession()">Pause</button>
-      </div>
+      <button class="btn-primary" onclick="armCoinAcceptor()">Insert Coin</button>
+      <button class="btn-secondary" onclick="pauseSession()">Pause</button>
     {% else %}
       <div class="timer">00:00</div>
       <div class="subtext">Tap below to start.</div>
@@ -147,16 +145,14 @@ function render(data) {
     area.innerHTML = `
       <div class="${timerClass}">${fmt(data.remaining_seconds)}</div>
       <div class="subtext">${data.ending_soon ? 'Session ending soon' : 'Connected. Enjoy!'}</div>
-      <div class="row">
-        <button class="btn-secondary" onclick="armCoinAcceptor()">Insert More Coins</button>
-        <button class="btn-secondary" onclick="pauseSession()">Pause</button>
-      </div>`;
+      <button class="btn-primary" onclick="armCoinAcceptor()">Insert Coin</button>
+      <button class="btn-secondary" onclick="pauseSession()">Pause</button>`;
   } else if (data.status === 'paused') {
     area.innerHTML = `
       <div class="timer">${fmt(data.remaining_seconds)}</div>
       <div class="subtext">Session paused. Your time is saved.</div>
-      <button class="btn-primary" onclick="resumeSession()">Resume</button>
-      <button class="btn-secondary" onclick="armCoinAcceptor()">Insert Coin</button>`;
+      <button class="btn-secondary" onclick="armCoinAcceptor()">Insert Coin</button>
+      <button class="btn-primary" onclick="resumeSession()">Resume</button>`;
   } else {
     // 'expired' or a fresh zero-balance session
     const label = data.armed ? 'Coin acceptor ready — insert your coin(s).' : 'Insert a coin to start a new session.';
