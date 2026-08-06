@@ -289,6 +289,33 @@ class SetupWizardTests(BoxAgentTestCase):
         self.assertEqual(resp.status_code, 302)
         self.assertIn("/setup", resp.headers["Location"])
 
+    def test_step2_hint_describes_create_account_flow(self):
+        """Session 92 Part A (#7): step 2's hint must describe creating an
+        admin account, not read as one continuous flow with no login step.
+        Step 2 only renders after a successful step-1 submission (Jinja
+        `elif step == 2` gate) -- a bare GET always renders step 1."""
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": True, "message": "License validated.",
+            }
+            resp = self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+        self.assertIn(b"Create your admin account, and set your customer-facing WiFi name.", resp.data)
+
+    def test_step2_password_field_labeled_create_admin_password(self):
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": True, "message": "License validated.",
+            }
+            resp = self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+        self.assertIn(b"Create admin password", resp.data)
+
+    def test_step4_copy_mentions_logging_in_with_created_account(self):
+        """This string lives inside the unconditional <script> block (the JS
+        string literal), not gated behind the Jinja step conditional, so a
+        single GET /setup at any step is enough to confirm it's present."""
+        resp = self.client.get("/setup")
+        self.assertIn(b"log in to the admin panel using the account you just created", resp.data)
+
     def test_screen1_rejects_empty_license_key(self):
         # No HTTP call should happen at all -- caught client-side before
         # requests.post is ever reached.
@@ -677,6 +704,178 @@ class AdminLoginLockoutTests(BoxAgentTestCase):
         resp = self.client.post("/admin/login", data={"password": "adminpass123"})
         self.assertIn(b"Too many failed attempts", resp.data)
         self.assertEqual(db.get_config(db.CFG_ADMIN_LOGIN_LOCKED_UNTIL), locked_until_before)
+
+
+class VoucherSystemTests(BoxAgentTestCase):
+    """Session 92 Part B (item #10, STEP 1 rule): operator-generated,
+    one-time-use voucher codes, redeemable via a new customer-facing
+    "Insert Voucher" option alongside Insert Coin / Pause."""
+
+    def setUp(self):
+        super().setUp()
+        from werkzeug.security import generate_password_hash
+        db.set_config(db.CFG_ADMIN_PASSWORD_HASH, generate_password_hash("adminpass123"))
+
+    def _login_admin(self):
+        resp = self.client.post(
+            "/admin/login", data={"password": "adminpass123"}, follow_redirects=True
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    # -- B1/B2/B3: admin voucher generation ------------------------------
+
+    def test_B1_admin_generates_voucher(self):
+        self._login_admin()
+        resp = self.client.post("/admin/vouchers", data={"minutes": "30"})
+        self.assertEqual(resp.status_code, 200)
+        vouchers = db.get_all_vouchers()
+        self.assertEqual(len(vouchers), 1)
+        self.assertEqual(vouchers[0]["minutes"], 30)
+        self.assertIsNone(vouchers[0]["redeemed_at"])
+        # the new code is shown to the operator
+        self.assertIn(vouchers[0]["code"].encode(), resp.data)
+
+    def test_B2_zero_minutes_rejected(self):
+        self._login_admin()
+        resp = self.client.post("/admin/vouchers", data={"minutes": "0"})
+        self.assertIn(b"whole number", resp.data)
+        self.assertIn(b"greater than 0", resp.data)
+        self.assertEqual(db.get_all_vouchers(), [])
+
+    def test_B2_negative_minutes_rejected(self):
+        self._login_admin()
+        resp = self.client.post("/admin/vouchers", data={"minutes": "-5"})
+        self.assertIn(b"whole number", resp.data)
+        self.assertIn(b"greater than 0", resp.data)
+        self.assertEqual(db.get_all_vouchers(), [])
+
+    def test_B2_non_numeric_minutes_rejected(self):
+        self._login_admin()
+        resp = self.client.post("/admin/vouchers", data={"minutes": "abc"})
+        self.assertIn(b"whole number", resp.data)
+        self.assertIn(b"greater than 0", resp.data)
+        self.assertEqual(db.get_all_vouchers(), [])
+
+    def test_B3_admin_vouchers_requires_login(self):
+        resp = self.client.get("/admin/vouchers")
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/admin/login", resp.headers["Location"])
+
+    # -- B4/B5/B6: customer redemption over HTTP --------------------------
+
+    def test_B4_valid_voucher_redemption_grants_time_and_activates(self):
+        db.create_voucher("ABCD2345", 30)
+        resp = self.client.post("/api/insert-voucher", data={"voucher_code": "ABCD2345"})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["status"], "active")
+        self.assertEqual(data["remaining_seconds"], 30 * 60)
+
+        active_sessions = db.get_all_active_sessions()
+        self.assertEqual(len(active_sessions), 1)
+        session = active_sessions[0]
+
+        voucher = db.get_voucher_by_code("ABCD2345")
+        self.assertIsNotNone(voucher["redeemed_at"])
+        self.assertEqual(voucher["redeemed_by_mac"], session["mac_address"])
+        self.assertEqual(voucher["redeemed_session_token"], session["session_token"])
+
+    def test_B5_redeeming_same_code_twice_rejected_no_double_grant(self):
+        db.create_voucher("EFGH6789", 20)
+        first = self.client.post("/api/insert-voucher", data={"voucher_code": "EFGH6789"})
+        self.assertEqual(first.status_code, 200)
+        remaining_after_first = first.get_json()["remaining_seconds"]
+
+        second = self.client.post("/api/insert-voucher", data={"voucher_code": "EFGH6789"})
+        self.assertEqual(second.status_code, 400)
+        self.assertIn("already used", second.get_json()["error"])
+
+        active_sessions = db.get_all_active_sessions()
+        self.assertEqual(active_sessions[0]["remaining_seconds"], remaining_after_first)
+
+    def test_B6_redeeming_nonexistent_code_rejected(self):
+        resp = self.client.post("/api/insert-voucher", data={"voucher_code": "NOSUCH99"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("not recognized", resp.get_json()["error"])
+        # get_current_session() always creates a zero-balance session row on
+        # first hit (status='active' by design regardless of balance, per
+        # db.create_session's docstring) -- confirm no time was granted,
+        # rather than asserting no session row exists at all.
+        active_sessions = db.get_all_active_sessions()
+        self.assertEqual(len(active_sessions), 1)
+        self.assertEqual(active_sessions[0]["remaining_seconds"], 0)
+
+    # -- B7: db-layer atomicity, bypassing the higher-level ValueError check --
+
+    def test_B7_redeem_voucher_atomicity_direct_db_call(self):
+        db.create_voucher("RACE1234", 10)
+        first = db.redeem_voucher("RACE1234", "aa:aa:aa:aa:aa:aa", "tok-first")
+        second = db.redeem_voucher("RACE1234", "bb:bb:bb:bb:bb:bb", "tok-second")
+        self.assertTrue(first)
+        self.assertFalse(second)
+
+    # -- B8: redeeming while paused tops up without forcing resume --------
+
+    def test_B8_redeeming_while_paused_tops_up_without_forcing_resume(self):
+        session = session_manager.resolve_session("dd:dd:dd:dd:dd:dd")
+        session_manager.handle_coin_pulse(session["session_token"])
+        session_manager.pause_session(session["session_token"])
+        remaining_before = db.get_session_by_token(session["session_token"])["remaining_seconds"]
+
+        db.create_voucher("PAUSE999", 15)
+        session_manager.handle_voucher_redeem(
+            session["session_token"], "PAUSE999", "dd:dd:dd:dd:dd:dd"
+        )
+
+        after = db.get_session_by_token(session["session_token"])
+        self.assertEqual(after["remaining_seconds"], remaining_before + 15 * 60)
+        self.assertEqual(after["status"], "paused")  # still paused, not forced active
+
+    # -- B9: case-insensitive redemption ------------------------------------
+
+    def test_B9_lowercase_code_redemption_still_succeeds(self):
+        db.create_voucher("MIXCASE1", 5)
+        resp = self.client.post("/api/insert-voucher", data={"voucher_code": "mixcase1"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["status"], "active")
+
+    # -- B10: empty code short-circuits before session_manager is called --
+
+    def test_B10_empty_voucher_code_rejected_without_calling_handle_voucher_redeem(self):
+        with patch("portal_app.session_manager.handle_voucher_redeem") as mock_redeem:
+            resp = self.client.post("/api/insert-voucher", data={"voucher_code": ""})
+            mock_redeem.assert_not_called()
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.get_json()["error"], "Enter a voucher code.")
+
+    # -- B11: generated code alphabet/length -------------------------------
+
+    def test_B11_generated_codes_use_expected_alphabet_and_length(self):
+        excluded_chars = set("0O1IL")
+        for i in range(20):
+            code = portal_app._generate_unique_voucher_code(i + 1)
+            self.assertEqual(len(code), portal_app.VOUCHER_CODE_LENGTH)
+            self.assertTrue(set(code).issubset(set(portal_app.VOUCHER_CODE_ALPHABET)))
+            self.assertFalse(set(code) & excluded_chars)
+
+    # -- B12: "Insert Voucher" trigger present regardless of session state --
+
+    def test_B12_insert_voucher_link_present_in_idle_state(self):
+        resp = self.client.get("/")
+        self.assertIn(b"Insert Voucher", resp.data)
+
+    def test_B12_insert_voucher_link_present_in_active_state(self):
+        # First hit establishes this client's session (get_client_mac()'s
+        # dev/test fallback derives a MAC from remote_addr, stable across
+        # requests from the same test client).
+        self.client.get("/")
+        active_sessions = db.get_all_active_sessions()
+        self.assertEqual(len(active_sessions), 1)
+        session_manager.handle_coin_pulse(active_sessions[0]["session_token"])
+
+        resp = self.client.get("/")
+        self.assertIn(b"Connected. Enjoy!", resp.data)  # confirms active state actually rendered
+        self.assertIn(b"Insert Voucher", resp.data)
 
 
 class InstallScriptTagPinningTests(unittest.TestCase):
