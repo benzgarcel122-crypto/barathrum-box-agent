@@ -106,6 +106,41 @@ def handle_coin_pulse(session_token, pulse_count=1):
     return session
 
 
+# --- voucher handling (item 10) ------------------------------------------
+
+def handle_voucher_redeem(session_token, voucher_code, mac_address):
+    """
+    Redeems a one-time-use voucher code, adding its minutes to the
+    session's balance. Mirrors handle_coin_pulse's additive/grant logic
+    (works whether the session is active, paused, or brand new; a
+    PAUSED session stays paused, same rule as item 15's coin-while-paused
+    behavior) -- but the added time comes from the voucher's own stored
+    value, not the configured coin rate, and no pesos transaction is
+    recorded (this isn't a cash payment).
+    """
+    voucher = db.get_voucher_by_code(voucher_code)
+    if voucher is None:
+        raise ValueError("Voucher code not recognized.")
+    if voucher["redeemed_at"] is not None:
+        raise ValueError("Voucher code already used.")
+
+    redeemed = db.redeem_voucher(voucher_code, mac_address, session_token)
+    if not redeemed:
+        # Someone else's request redeemed it in the race window between
+        # the check above and this call -- fail closed, do not grant
+        # time twice for the same code.
+        raise ValueError("Voucher code already used.")
+
+    db.add_remaining(session_token, voucher["minutes"] * 60)
+    session = db.get_session_by_token(session_token)
+
+    if session["status"] not in ("paused",) and session["remaining_seconds"] > 0:
+        db.set_status(session_token, "active")
+        network_manager.grant_mac(mac_address)
+
+    return session
+
+
 # --- pause/resume (item 15) ---------------------------------------------
 
 def pause_session(session_token):
