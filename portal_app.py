@@ -18,6 +18,8 @@ device can still be recognized on its next connection.
 
 import logging
 import re
+import secrets
+import sqlite3
 import subprocess
 import time
 from functools import wraps
@@ -76,6 +78,30 @@ def get_client_mac():
     except (subprocess.CalledProcessError, FileNotFoundError):
         logger.warning("get_client_mac() failed for %s -- not running on real LAN?", client_ip)
         return None
+
+
+VOUCHER_CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+VOUCHER_CODE_LENGTH = 8
+VOUCHER_CODE_MAX_GENERATION_ATTEMPTS = 5
+
+
+def _generate_unique_voucher_code(minutes):
+    """Generates an unused code and inserts it in one step -- collision
+    on an 8-char/32-alphabet space (32**8 possibilities) is astronomically
+    unlikely, but retried defensively rather than assumed impossible."""
+    for _ in range(VOUCHER_CODE_MAX_GENERATION_ATTEMPTS):
+        code = "".join(
+            secrets.choice(VOUCHER_CODE_ALPHABET) for _ in range(VOUCHER_CODE_LENGTH)
+        )
+        try:
+            db.create_voucher(code, minutes)
+            return code
+        except sqlite3.IntegrityError:
+            continue
+    raise RuntimeError(
+        f"Could not generate a unique voucher code after "
+        f"{VOUCHER_CODE_MAX_GENERATION_ATTEMPTS} attempts."
+    )
 
 
 def get_current_session():
@@ -183,6 +209,20 @@ def api_resume_session():
     except (ValueError, PermissionError) as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({"status": "active"})
+
+
+@app.route("/api/insert-voucher", methods=["POST"])
+def api_insert_voucher():
+    session, mac = get_current_session()
+    voucher_code = request.form.get("voucher_code", "").strip().upper()
+    if not voucher_code:
+        return jsonify({"error": "Enter a voucher code."}), 400
+    try:
+        session_manager.handle_voucher_redeem(session["session_token"], voucher_code, mac)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    updated = db.get_session_by_token(session["session_token"])
+    return jsonify({"status": updated["status"], "remaining_seconds": updated["remaining_seconds"]})
 
 
 # --- on-box admin panel (rules #9, #12) ----------------------------------
@@ -304,6 +344,30 @@ def admin_settings():
         relay_pin=db.get_config(db.CFG_RELAY_PIN, config.DEFAULT_RELAY_PIN),
         arm_ignore_window=config.ARM_IGNORE_WINDOW_SECONDS,
         arm_accept_window=config.ARM_ACCEPT_WINDOW_SECONDS,
+    )
+
+
+@app.route("/admin/vouchers", methods=["GET", "POST"])
+@admin_login_required
+def admin_vouchers():
+    error = None
+    new_code = None
+    if request.method == "POST":
+        minutes_raw = request.form.get("minutes", "")
+        try:
+            minutes = int(minutes_raw)
+            if minutes <= 0:
+                raise ValueError
+        except ValueError:
+            error = "Enter a whole number of minutes greater than 0."
+        else:
+            new_code = _generate_unique_voucher_code(minutes)
+
+    return render_template(
+        "admin_vouchers.html",
+        vouchers=db.get_all_vouchers(),
+        error=error,
+        new_code=new_code,
     )
 
 
