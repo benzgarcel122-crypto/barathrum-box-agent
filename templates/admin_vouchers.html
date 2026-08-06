@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vouchers — Admin</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="admin-shell">
+  <nav>
+    <div class="brand">Barathrum</div>
+    <a href="/admin">Status</a>
+    <a href="/admin/sessions">Sessions</a>
+    <a href="/admin/vouchers" class="active">Vouchers</a>
+    <a href="/admin/settings">Settings</a>
+    <a href="/admin/logout" class="logout">Log out</a>
+  </nav>
+  <main>
+    <h1>Vouchers</h1>
+
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    {% if new_code %}
+      <div class="hint" style="background: rgba(61,220,132,0.12); padding: 12px; border-radius: 8px; margin-bottom: 16px;">
+        New voucher created — give this code to the customer: <strong>{{ new_code }}</strong>
+      </div>
+    {% endif %}
+
+    <form method="post">
+      <label>Minutes this voucher is worth</label>
+      <input type="number" name="minutes" min="1" required>
+      <button type="submit" class="btn-primary">Generate voucher</button>
+    </form>
+
+    <h2 style="margin-top: 32px;">All vouchers</h2>
+    {% if vouchers %}
+      <table style="width:100%; border-collapse: collapse; margin-top: 12px;">
+        <thead>
+          <tr style="text-align:left; border-bottom: 1px solid var(--border);">
+            <th style="padding: 8px 4px;">Code</th>
+            <th style="padding: 8px 4px;">Minutes</th>
+            <th style="padding: 8px 4px;">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for v in vouchers %}
+          <tr style="border-bottom: 1px solid var(--border);">
+            <td style="padding: 8px 4px;">{{ v.code }}</td>
+            <td style="padding: 8px 4px;">{{ v.minutes }}</td>
+            <td style="padding: 8px 4px;">
+              {% if v.redeemed_at %}Redeemed{% else %}Unredeemed{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="hint">No vouchers generated yet.</p>
+    {% endif %}
+  </main>
+</div>
+</body>
+</html>
