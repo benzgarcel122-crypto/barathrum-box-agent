@@ -63,7 +63,7 @@ DEBOUNCE_SECONDS = 0.05
 
 # Arm/disarm timing (STEP 1 rule #4):
 ARM_IGNORE_WINDOW_SECONDS = 1.5   # suppress power-up phantom-pulse issue
-ARM_ACCEPT_WINDOW_SECONDS = 60    # resets on each valid coin
+ARM_ACCEPT_WINDOW_SECONDS = 30    # resets on each valid coin
 
 # --- Rate model (STEP 1 rule #5) ----------------------------------------
 
