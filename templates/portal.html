@@ -41,6 +41,24 @@
   .row { display: flex; gap: 10px; }
   .row button { margin-top: 10px; }
   .hint { font-size: 12px; color: var(--muted); margin-top: 16px; line-height: 1.5; }
+  .popup-overlay {
+    position: fixed; inset: 0; background: rgba(15,17,21,0.85);
+    display: flex; align-items: center; justify-content: center; z-index: 100;
+  }
+  .popup-card {
+    background: var(--card); border-radius: var(--radius); padding: 32px 24px;
+    text-align: center; width: 90%; max-width: 320px;
+  }
+  .popup-timer {
+    font-size: 56px; font-weight: 700; font-variant-numeric: tabular-nums;
+    color: var(--accent);
+  }
+  .popup-subtext { color: var(--muted); font-size: 14px; margin: 8px 0 20px; }
+  .busy-toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: var(--danger); color: #fff; padding: 10px 18px; border-radius: 8px;
+    font-size: 13px; z-index: 100;
+  }
 </style>
 </head>
 <body>
@@ -74,10 +92,6 @@
     {% endif %}
   </div>
 
-  <div class="hint" id="armed-hint" style="display:none;">
-    Coin acceptor is ready — insert your coin(s) now.
-  </div>
-
   <div id="voucher-toggle-area">
     <a href="#" onclick="toggleVoucherForm(); return false;" style="color: var(--muted); font-size: 13px; text-decoration: underline;">Insert Voucher</a>
     <div id="voucher-form" style="display:none; margin-top: 12px;">
@@ -88,6 +102,15 @@
   </div>
 </div>
 
+<div id="arm-popup" class="popup-overlay" style="display:none;">
+  <div class="popup-card">
+    <div class="popup-timer" id="popup-timer">{{ arm_window_seconds }}</div>
+    <div class="popup-subtext">Insert your coin(s) now</div>
+    <button class="btn-primary" onclick="doneCoinAcceptor()">Done</button>
+  </div>
+</div>
+<div id="busy-toast" class="busy-toast" style="display:none;">Coin acceptor is busy.</div>
+
 <script>
 function fmt(totalSeconds) {
   totalSeconds = Math.max(0, Math.floor(totalSeconds));
@@ -96,9 +119,49 @@ function fmt(totalSeconds) {
   return m + ':' + String(s).padStart(2, '0');
 }
 
+const ARM_WINDOW_SECONDS = {{ arm_window_seconds }};
+let armPopupInterval = null;
+let armLocalRemaining = 0;
+
 async function armCoinAcceptor() {
-  await fetch('/api/insert-coin/arm', { method: 'POST' });
-  document.getElementById('armed-hint').style.display = 'block';
+  const resp = await fetch('/api/insert-coin/arm', { method: 'POST' });
+  const data = await resp.json();
+  if (!resp.ok || !data.armed) {
+    showBusyToast(data.error || 'Coin acceptor is busy.');
+    return;
+  }
+  openArmPopup(ARM_WINDOW_SECONDS);
+  poll();
+}
+
+function openArmPopup(startSeconds) {
+  armLocalRemaining = startSeconds;
+  document.getElementById('popup-timer').textContent = armLocalRemaining;
+  document.getElementById('arm-popup').style.display = 'flex';
+  if (armPopupInterval) clearInterval(armPopupInterval);
+  armPopupInterval = setInterval(() => {
+    armLocalRemaining = Math.max(0, armLocalRemaining - 1);
+    document.getElementById('popup-timer').textContent = armLocalRemaining;
+    if (armLocalRemaining <= 0) closeArmPopup();
+  }, 1000);
+}
+
+function closeArmPopup() {
+  document.getElementById('arm-popup').style.display = 'none';
+  if (armPopupInterval) { clearInterval(armPopupInterval); armPopupInterval = null; }
+}
+
+async function doneCoinAcceptor() {
+  await fetch('/api/insert-coin/done', { method: 'POST' });
+  closeArmPopup();
+  poll();
+}
+
+function showBusyToast(msg) {
+  const el = document.getElementById('busy-toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => { el.style.display = 'none'; }, 3000);
 }
 
 async function pauseSession() {
@@ -140,26 +203,43 @@ function render(data) {
   const rateLine = document.getElementById('rate-line');
   rateLine.textContent = 'Rate applies per operator settings';
 
+  // Resync the popup to server truth every poll -- corrects for local
+  // drift, tab backgrounding, and coin-triggered window resets, all of
+  // which the local 1s interval alone cannot know about.
+  if (data.armed_by_me) {
+    if (armPopupInterval === null) openArmPopup(data.armed_remaining_seconds);
+    else {
+      armLocalRemaining = data.armed_remaining_seconds;
+      document.getElementById('popup-timer').textContent = armLocalRemaining;
+    }
+  } else if (armPopupInterval !== null) {
+    closeArmPopup();
+  }
+
+  const otherDeviceBusy = data.armed && !data.armed_by_me;
+  const insertCoinDisabled = otherDeviceBusy ? 'disabled' : '';
+  const insertCoinLabel = otherDeviceBusy ? 'Coin acceptor is busy' : 'Insert Coin';
+
   if (data.status === 'active') {
     const timerClass = data.ending_soon ? 'timer ending-soon' : 'timer';
     area.innerHTML = `
       <div class="${timerClass}">${fmt(data.remaining_seconds)}</div>
       <div class="subtext">${data.ending_soon ? 'Session ending soon' : 'Connected. Enjoy!'}</div>
-      <button class="btn-primary" onclick="armCoinAcceptor()">Insert Coin</button>
+      <button class="btn-primary" onclick="armCoinAcceptor()" ${insertCoinDisabled}>${insertCoinLabel}</button>
       <button class="btn-secondary" onclick="pauseSession()">Pause</button>`;
   } else if (data.status === 'paused') {
     area.innerHTML = `
       <div class="timer">${fmt(data.remaining_seconds)}</div>
       <div class="subtext">Session paused. Your time is saved.</div>
-      <button class="btn-secondary" onclick="armCoinAcceptor()">Insert Coin</button>
+      <button class="btn-secondary" onclick="armCoinAcceptor()" ${insertCoinDisabled}>${insertCoinLabel}</button>
       <button class="btn-primary" onclick="resumeSession()">Resume</button>`;
   } else {
     // 'expired' or a fresh zero-balance session
-    const label = data.armed ? 'Coin acceptor ready — insert your coin(s).' : 'Insert a coin to start a new session.';
+    const label = otherDeviceBusy ? 'Coin acceptor is busy.' : 'Insert a coin to start a new session.';
     area.innerHTML = `
       <div class="timer expired">00:00</div>
       <div class="subtext">${label}</div>
-      <button class="btn-primary" onclick="armCoinAcceptor()">Insert Coin</button>`;
+      <button class="btn-primary" onclick="armCoinAcceptor()" ${insertCoinDisabled}>${insertCoinLabel}</button>`;
   }
 }
 
