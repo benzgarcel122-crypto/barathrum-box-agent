@@ -150,6 +150,7 @@ def portal_root():
             "portal.html",
             session=session,
             ending_soon_threshold=config.SESSION_ENDING_SOON_THRESHOLD_SECONDS,
+            arm_window_seconds=config.ARM_ACCEPT_WINDOW_SECONDS,
         )
     )
     return _set_customer_cookie(response, session["session_token"])
@@ -162,10 +163,19 @@ def api_session_status():
     time's-up) in sync without a full page reload."""
     session, mac = get_current_session()
     armed = _coin_acceptor.is_armed() if _coin_acceptor else False
+    armed_by_me = (
+        _coin_acceptor is not None
+        and _coin_acceptor.get_armed_session_token() == session["session_token"]
+    )
+    armed_remaining_seconds = (
+        _coin_acceptor.get_armed_remaining_seconds() if _coin_acceptor else 0
+    )
     return jsonify({
         "status": session["status"],
         "remaining_seconds": session["remaining_seconds"],
         "armed": armed,
+        "armed_by_me": armed_by_me,
+        "armed_remaining_seconds": armed_remaining_seconds,
         "ending_soon": (
             session["status"] == "active"
             and 0 < session["remaining_seconds"] <= config.SESSION_ENDING_SOON_THRESHOLD_SECONDS
@@ -180,15 +190,37 @@ def api_arm_coin_acceptor():
     fires, and the accept window genuinely does auto-expire (rule #4).
 
     Passes this request's own session_token to arm() so a real coin
-    pulse can be attributed back to the right session (see
-    gpio_handler.CoinAcceptor.arm()'s docstring for the race behavior
-    when two devices both arm within the same window)."""
+    pulse can be attributed back to the right session. Coin-arming is
+    exclusive -- if a different session is already armed, this call is
+    rejected outright (see gpio_handler.CoinAcceptor.arm()'s docstring)."""
     if _coin_acceptor is None:
         return jsonify({"error": "Coin acceptor not initialized."}), 503
     session, mac = get_current_session()
-    _coin_acceptor.arm(session_token=session["session_token"])
+    armed = _coin_acceptor.arm(session_token=session["session_token"])
+    if not armed:
+        return jsonify({
+            "armed": False,
+            "error": "Coin acceptor is busy.",
+        }), 409
     response = jsonify({"armed": True})
     return _set_customer_cookie(response, session["session_token"])
+
+
+@app.route("/api/insert-coin/done", methods=["POST"])
+def api_done_coin_acceptor():
+    """Customer taps "Done" in the countdown popup once their coin has
+    registered. Idempotent and side-effect-free if called when this
+    session isn't the one currently armed (e.g. a stale click after the
+    window already auto-expired) -- returns disarmed:false rather than
+    an error, since that's not a real failure from the customer's
+    perspective."""
+    if _coin_acceptor is None:
+        return jsonify({"error": "Coin acceptor not initialized."}), 503
+    session, mac = get_current_session()
+    if _coin_acceptor.get_armed_session_token() != session["session_token"]:
+        return jsonify({"disarmed": False})
+    _coin_acceptor.disarm()
+    return jsonify({"disarmed": True})
 
 
 @app.route("/api/session/pause", methods=["POST"])
