@@ -87,26 +87,22 @@ class CoinAcceptor:
         `session_token` identifies which session's "Insert Coin" tap
         triggered this arm -- pulses received while armed are attributed
         to whoever is CURRENTLY recorded here, read fresh at pulse time
-        (not captured into a closure), which is what makes the
-        known-and-accepted race case below deterministic rather than
-        undefined:
+        (not captured into a closure).
 
-        Single physical coin slot means only one device can realistically
-        be mid-insertion at a time, but nothing stops two devices from
-        both tapping "Insert Coin" within the same window. Documented,
-        accepted behavior for this build: the MOST RECENT arm() call always
-        wins -- re-arming (even by the same session re-tapping) overwrites
-        `_armed_session_token`, so any pulse from that point on attributes
-        to whoever armed last. This can misattribute a real coin to the
-        wrong session in that specific race, but never double-grants,
-        never drops a pulse silently, and never blocks either device from
-        successfully inserting -- an acceptable MVP tradeoff for a
-        one-coin-slot device, not a data-loss or fail-open risk. Revisit
-        only if this turns out to be a real complaint pattern (same
-        standing rule this project applies to other flagged MVP
-        limitations, e.g. rule #8's WAN-outage-mid-session gap).
+        Returns True if this call successfully armed (or refreshed) the
+        acceptor. Returns False if a DIFFERENT session_token is already
+        armed -- the caller must not treat this as success. The
+        already-armed session is completely unaffected by a rejected
+        call: no state changes, no window reset, on the rejected side.
+
+        A session re-arming with its OWN, already-armed session_token is
+        allowed and treated as a deliberate window refresh (not a
+        conflict) -- this covers a device re-tapping "Insert Coin" while
+        its own popup is still open.
         """
         with self._lock:
+            if self._armed and self._armed_session_token != session_token:
+                return False
             self._armed = True
             self._armed_session_token = session_token
             self._arm_started_at = time.time()
@@ -116,6 +112,7 @@ class CoinAcceptor:
         else:
             logger.info("[SIMULATED] Relay armed for session_token=%s.", session_token)
         self._start_watchdog()
+        return True
 
     def disarm(self):
         with self._lock:
@@ -134,6 +131,14 @@ class CoinAcceptor:
     def get_armed_session_token(self):
         with self._lock:
             return self._armed_session_token
+
+    def get_armed_remaining_seconds(self):
+        with self._lock:
+            if not self._armed:
+                return 0
+            idle_for = time.time() - self._last_activity_at
+        remaining = config.ARM_ACCEPT_WINDOW_SECONDS - idle_for
+        return max(0, round(remaining))
 
     def simulate_pulse(self):
         """Test/dev-only hook -- lets the portal or a test script simulate
