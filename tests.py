@@ -114,26 +114,159 @@ class CoinInsertionTests(BoxAgentTestCase):
         pesos, minutes = session_manager._get_rate()
         self.assertEqual(status["remaining_seconds"], 3 * minutes * 60)
 
-    def test_arm_race_most_recent_armer_receives_the_pulse(self):
+    def test_arm_lock_rejects_second_device_while_first_armed(self):
         """
-        Documented, accepted behavior (see gpio_handler.CoinAcceptor.arm()
-        docstring): two devices both tap "Insert Coin" within the same
-        window -- the pulse goes to whoever armed MOST RECENTLY, not the
-        first armer. This test pins that behavior down explicitly rather
-        than leaving it unverified.
+        Replaces test_arm_race_most_recent_armer_receives_the_pulse -- the
+        old "most recent arm() call wins" behavior that test pinned down is
+        no longer possible. Coin-arming is now exclusive: Device A arms;
+        Device B's arm() call is rejected outright, and a real coin pulse
+        during A's window is credited only to A.
         """
-        session_a, mac_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa"), "aa:aa:aa:aa:aa:aa"
-        session_b, mac_b = session_manager.resolve_session("bb:bb:bb:bb:bb:bb"), "bb:bb:bb:bb:bb:bb"
+        session_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        session_b = session_manager.resolve_session("bb:bb:bb:bb:bb:bb")
 
-        self.acceptor.arm(session_token=session_a["session_token"])
-        self.acceptor.arm(session_token=session_b["session_token"])  # B arms second -- wins
+        armed_a = self.acceptor.arm(session_token=session_a["session_token"])
+        armed_b = self.acceptor.arm(session_token=session_b["session_token"])
+        self.assertTrue(armed_a)
+        self.assertFalse(armed_b)
+
         self.acceptor._arm_started_at -= 2.0
+        self.acceptor._last_activity_at -= 2.0
         self.acceptor.simulate_pulse()
 
         refreshed_a = db.get_session_by_token(session_a["session_token"])
         refreshed_b = db.get_session_by_token(session_b["session_token"])
-        self.assertEqual(refreshed_a["remaining_seconds"], 0)
-        self.assertGreater(refreshed_b["remaining_seconds"], 0)
+        self.assertGreater(refreshed_a["remaining_seconds"], 0)
+        self.assertEqual(refreshed_b["remaining_seconds"], 0)
+        self.assertEqual(self.acceptor.get_armed_session_token(), session_a["session_token"])
+
+    def test_arm_lock_rejected_call_leaves_armer_state_untouched(self):
+        session_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        session_b = session_manager.resolve_session("bb:bb:bb:bb:bb:bb")
+
+        self.acceptor.arm(session_token=session_a["session_token"])
+        arm_started_at_before = self.acceptor._arm_started_at
+        last_activity_before = self.acceptor._last_activity_at
+
+        result = self.acceptor.arm(session_token=session_b["session_token"])
+
+        self.assertFalse(result)
+        self.assertEqual(self.acceptor.get_armed_session_token(), session_a["session_token"])
+        self.assertEqual(self.acceptor._arm_started_at, arm_started_at_before)
+        self.assertEqual(self.acceptor._last_activity_at, last_activity_before)
+
+    def test_arm_http_endpoint_returns_409_when_busy(self):
+        session_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        session_b = session_manager.resolve_session("bb:bb:bb:bb:bb:bb")
+
+        with patch("portal_app.get_current_session", return_value=(session_a, "aa:aa:aa:aa:aa:aa")):
+            resp_a = self.client.post("/api/insert-coin/arm")
+        self.assertEqual(resp_a.status_code, 200)
+        self.assertTrue(resp_a.get_json()["armed"])
+
+        with patch("portal_app.get_current_session", return_value=(session_b, "bb:bb:bb:bb:bb:bb")):
+            resp_b = self.client.post("/api/insert-coin/arm")
+        self.assertEqual(resp_b.status_code, 409)
+        data_b = resp_b.get_json()
+        self.assertFalse(data_b["armed"])
+        self.assertEqual(data_b["error"], "Coin acceptor is busy.")
+        self.assertEqual(self.acceptor.get_armed_session_token(), session_a["session_token"])
+
+    def test_arm_same_session_rearm_is_a_refresh_not_a_conflict(self):
+        session_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        self.acceptor.arm(session_token=session_a["session_token"])
+        first_started_at = self.acceptor._arm_started_at
+        time.sleep(0.05)
+        result = self.acceptor.arm(session_token=session_a["session_token"])
+        self.assertTrue(result)
+        self.assertGreater(self.acceptor._arm_started_at, first_started_at)
+        self.assertEqual(self.acceptor.get_armed_session_token(), session_a["session_token"])
+
+    def test_lock_releases_on_natural_expiry_then_other_device_can_arm(self):
+        session_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        session_b = session_manager.resolve_session("bb:bb:bb:bb:bb:bb")
+
+        self.acceptor.arm(session_token=session_a["session_token"])
+        # Simulate the watchdog's own expiry condition directly -- back-date
+        # idle time past the window (same back-dating pattern used
+        # elsewhere in this file) rather than sleeping through the real
+        # watchdog loop.
+        self.acceptor._last_activity_at -= (config.ARM_ACCEPT_WINDOW_SECONDS + 1)
+        self.assertEqual(self.acceptor.get_armed_remaining_seconds(), 0)
+        self.acceptor.disarm()
+
+        self.assertFalse(self.acceptor.is_armed())
+        armed_b = self.acceptor.arm(session_token=session_b["session_token"])
+        self.assertTrue(armed_b)
+
+    def test_done_endpoint_owning_session_disarms(self):
+        session_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        self.acceptor.arm(session_token=session_a["session_token"])
+
+        with patch("portal_app.get_current_session", return_value=(session_a, "aa:aa:aa:aa:aa:aa")):
+            resp = self.client.post("/api/insert-coin/done")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.get_json()["disarmed"])
+        self.assertFalse(self.acceptor.is_armed())
+
+    def test_done_endpoint_stale_or_non_owning_call_is_a_noop(self):
+        session_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        session_b = session_manager.resolve_session("bb:bb:bb:bb:bb:bb")
+
+        # Nothing armed at all yet -- calling Done anyway must not raise
+        # or fabricate a disarm.
+        with patch("portal_app.get_current_session", return_value=(session_a, "aa:aa:aa:aa:aa:aa")):
+            resp = self.client.post("/api/insert-coin/done")
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.get_json()["disarmed"])
+
+        # A is armed; B calls Done -- must not disarm A.
+        self.acceptor.arm(session_token=session_a["session_token"])
+        with patch("portal_app.get_current_session", return_value=(session_b, "bb:bb:bb:bb:bb:bb")):
+            resp2 = self.client.post("/api/insert-coin/done")
+        self.assertEqual(resp2.status_code, 200)
+        self.assertFalse(resp2.get_json()["disarmed"])
+        self.assertTrue(self.acceptor.is_armed())
+        self.assertEqual(self.acceptor.get_armed_session_token(), session_a["session_token"])
+
+    def test_get_armed_remaining_seconds_reflects_idle_reset_not_flat_elapsed(self):
+        """
+        The countdown is idle-reset (mirrors _watchdog_loop()'s own idle
+        math), not a flat "30s since arm time" -- a plausible-looking but
+        wrong flat implementation would still pass most other tests here
+        but silently misbehave for a real customer topping up mid-window.
+        """
+        session_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        self.acceptor.arm(session_token=session_a["session_token"])
+
+        # Simulate 25s of silence since the last real activity.
+        self.acceptor._arm_started_at -= 25.0
+        self.acceptor._last_activity_at -= 25.0
+        remaining_after_idle = self.acceptor.get_armed_remaining_seconds()
+        self.assertAlmostEqual(remaining_after_idle, 5, delta=1)
+
+        # A real pulse arrives -- _last_activity_at resets to "now," so the
+        # countdown must jump back up to (approximately) the full window,
+        # not continue counting down from where it was.
+        self.acceptor.simulate_pulse()
+        remaining_after_pulse = self.acceptor.get_armed_remaining_seconds()
+        self.assertAlmostEqual(remaining_after_pulse, config.ARM_ACCEPT_WINDOW_SECONDS, delta=1)
+
+    def test_session_status_armed_by_me_is_requester_relative(self):
+        session_a = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        session_b = session_manager.resolve_session("bb:bb:bb:bb:bb:bb")
+        self.acceptor.arm(session_token=session_a["session_token"])
+
+        with patch("portal_app.get_current_session", return_value=(session_a, "aa:aa:aa:aa:aa:aa")):
+            status_a = self.client.get("/api/session/status").get_json()
+        with patch("portal_app.get_current_session", return_value=(session_b, "bb:bb:bb:bb:bb:bb")):
+            status_b = self.client.get("/api/session/status").get_json()
+
+        self.assertTrue(status_a["armed"])
+        self.assertTrue(status_a["armed_by_me"])
+        self.assertTrue(status_b["armed"])
+        self.assertFalse(status_b["armed_by_me"])
 
 
 class ZeroBalanceCutoffTests(BoxAgentTestCase):
