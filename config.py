@@ -68,7 +68,9 @@ ARM_ACCEPT_WINDOW_SECONDS = 30    # resets on each valid coin
 # --- License points / concurrent-user cap (End Goals #14/#17) ----------
 
 MAX_CONCURRENT_USERS_WITHOUT_LICENSE_POINTS = 2
-LICENSE_POINTS_SYNC_INTERVAL_SECONDS = 300  # 5 minutes
+LICENSE_POINTS_SYNC_INTERVAL_SECONDS = 60  # 1 minute (was 5 min -- tightens the box's
+# re-cap detection window; still well under the /api/box/license-points/ rate limit of 10
+# requests per 300s per IP, since this is 1 poll/60s = 5 polls per 300s window)
 
 # --- Rate model (STEP 1 rule #5) ----------------------------------------
 
