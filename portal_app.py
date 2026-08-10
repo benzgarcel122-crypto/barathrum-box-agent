@@ -196,6 +196,23 @@ def api_arm_coin_acceptor():
     if _coin_acceptor is None:
         return jsonify({"error": "Coin acceptor not initialized."}), 503
     session, mac = get_current_session()
+    # End Goals #14: gate at ARM time, not pulse time -- refusing to arm means the coin
+    # acceptor's relay never enables, so a physical coin is never even accepted by the
+    # hardware, and no balance is ever at risk. Checked against remaining_seconds, NOT the raw
+    # `status` column: per db.create_session()'s own docstring, a brand-new session is always
+    # created with status='active' regardless of balance -- so "already holds a grant" is
+    # genuinely remaining_seconds > 0 while not paused. A paused session, or an active session
+    # that already has a positive balance (topping up), is never gated; only a genuinely fresh
+    # (0 balance) or expired (ran out) session is.
+    if (
+        session["status"] != "paused"
+        and session["remaining_seconds"] <= 0
+        and not session_manager.can_grant_new_active_slot()
+    ):
+        return jsonify({
+            "armed": False,
+            "error": "Maximum users reached. Try again later.",
+        }), 403
     armed = _coin_acceptor.arm(session_token=session["session_token"])
     if not armed:
         return jsonify({
@@ -451,6 +468,10 @@ def setup_wizard():
             )
 
         flask_session["setup_license_key"] = license_key
+        # End Goals #17: initial value, free, no extra round-trip -- validate-license's response
+        # already includes license_points, so the box stores it immediately on successful bind
+        # rather than waiting for the first background sync.
+        db.set_config(db.CFG_LICENSE_POINTS, str(data.get("license_points", 0)))
         return render_template("setup.html", step=2)
 
     if request.method == "POST" and step == "2":
