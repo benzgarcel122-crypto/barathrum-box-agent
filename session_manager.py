@@ -18,11 +18,70 @@ import logging
 import threading
 import time
 
+import requests
+
 import config
 import db
 import network_manager
 
 logger = logging.getLogger("barathrum.session")
+
+
+# --- license points / concurrent-user cap (End Goals #14/#17) -----------
+
+def can_grant_new_active_slot():
+    """
+    End Goals #14: True if a NEW concurrent-active slot may be granted right now -- either the
+    bound license has any positive points balance (unlimited), or fewer than
+    config.MAX_CONCURRENT_USERS_WITHOUT_LICENSE_POINTS sessions are currently 'active'.
+
+    Callers must only invoke this for a transition that actually CONSUMES a new slot (a
+    fresh/expired session's first coin/voucher, or a resume) -- an already-active session
+    topping up, or a paused session topping up without resuming, never call this at all, since
+    neither one takes a new slot.
+    """
+    license_points = int(db.get_config(db.CFG_LICENSE_POINTS, "0") or "0")
+    if license_points > 0:
+        return True
+    # Counted against actual live grants (status=='active' AND remaining_seconds > 0), not the
+    # raw status column alone: per db.create_session()'s own docstring, a brand-new session is
+    # always created with status='active' regardless of balance, so a customer who merely
+    # opened the portal without paying would otherwise inflate this count without ever holding
+    # a real grant.
+    active_count = sum(
+        1 for s in db.get_all_active_sessions()
+        if s["status"] == "active" and s["remaining_seconds"] > 0
+    )
+    return active_count < config.MAX_CONCURRENT_USERS_WITHOUT_LICENSE_POINTS
+
+
+def sync_license_points():
+    """
+    End Goals #17 -- periodic poll (see BackgroundLoop), fetches this box's bound license's
+    current points balance and caches it locally (db.CFG_LICENSE_POINTS), which
+    can_grant_new_active_slot() reads. Deliberately network-tolerant: on ANY failure (no license
+    bound yet, network unreachable, malformed response), the existing cached value is left
+    completely untouched, just a logged warning -- a transient hiccup must never suddenly drop
+    an already-unlocked box back to the 2-user cap. The cached value only changes on a genuinely
+    successful poll.
+    """
+    license_key = db.get_config(db.CFG_LICENSE_KEY)
+    if not license_key:
+        return
+    try:
+        resp = requests.post(
+            f"{config.DASHBOARD_API_BASE_URL}/api/box/license-points/",
+            json={"license_key": license_key},
+            timeout=10,
+        )
+        data = resp.json()
+    except (requests.exceptions.RequestException, ValueError):
+        logger.warning("License points sync failed -- network/parse error, keeping cached value.")
+        return
+    if not data.get("valid"):
+        logger.warning("License points sync failed -- %s", data.get("message", "unknown error"))
+        return
+    db.set_config(db.CFG_LICENSE_POINTS, str(int(data.get("license_points", 0))))
 
 
 def _get_rate():
@@ -124,6 +183,25 @@ def handle_voucher_redeem(session_token, voucher_code, mac_address):
     if voucher["redeemed_at"] is not None:
         raise ValueError("Voucher code already used.")
 
+    # End Goals #14: gate BEFORE db.redeem_voucher() marks the code used -- a refused attempt
+    # must leave the voucher code completely untouched so the customer can redeem it later once
+    # a slot opens. Checked against remaining_seconds, NOT the raw `status` column: per
+    # db.create_session()'s own docstring, a brand-new session is always created with
+    # status='active' regardless of balance (that's deliberate, unrelated plumbing) -- so
+    # "already holds a grant" is genuinely remaining_seconds > 0 while not paused, exactly the
+    # same condition this function's own grant_mac() call below already uses. A paused session,
+    # or an active session that already has a positive balance, is never gated; only a
+    # genuinely fresh (0 balance, never funded) or expired (ran out) session is.
+    current_session = db.get_session_by_token(session_token)
+    if current_session is None:
+        raise ValueError(f"No session for token {session_token}")
+    if (
+        current_session["status"] != "paused"
+        and current_session["remaining_seconds"] <= 0
+        and not can_grant_new_active_slot()
+    ):
+        raise ValueError("Maximum users reached. Try again later.")
+
     redeemed = db.redeem_voucher(voucher_code, mac_address, session_token)
     if not redeemed:
         # Someone else's request redeemed it in the race window between
@@ -172,6 +250,8 @@ def resume_session(session_token, requesting_mac_address):
             "Resume is bound to the device that paused this session; "
             "MAC does not match."
         )
+    if not can_grant_new_active_slot():
+        raise ValueError("Maximum users reached. Try again later.")
     db.set_status(session_token, "active", paused_at=None)
     network_manager.grant_mac(session["mac_address"])
     logger.info("Session %s resumed.", session_token)
@@ -277,9 +357,17 @@ class BackgroundLoop:
     sleep loop, not a full scheduler) since this only ever needs to run
     inside a single long-lived agent process."""
 
-    def __init__(self, tick_interval_seconds=1, abandonment_check_interval_seconds=3600):
+    def __init__(
+        self, tick_interval_seconds=1, abandonment_check_interval_seconds=3600,
+        license_points_sync_interval_seconds=None,
+    ):
         self.tick_interval = tick_interval_seconds
         self.abandonment_check_interval = abandonment_check_interval_seconds
+        self.license_points_sync_interval = (
+            license_points_sync_interval_seconds
+            if license_points_sync_interval_seconds is not None
+            else config.LICENSE_POINTS_SYNC_INTERVAL_SECONDS
+        )
         self._stop = threading.Event()
         self._thread = None
 
@@ -292,10 +380,14 @@ class BackgroundLoop:
 
     def _run(self):
         last_abandonment_check = 0.0
+        last_license_points_sync = 0.0
         while not self._stop.is_set():
             tick_active_sessions(self.tick_interval)
             now = time.time()
             if now - last_abandonment_check >= self.abandonment_check_interval:
                 check_pause_abandonment()
                 last_abandonment_check = now
+            if now - last_license_points_sync >= self.license_points_sync_interval:
+                sync_license_points()
+                last_license_points_sync = now
             time.sleep(self.tick_interval)
