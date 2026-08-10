@@ -65,6 +65,11 @@ DEBOUNCE_SECONDS = 0.05
 ARM_IGNORE_WINDOW_SECONDS = 1.5   # suppress power-up phantom-pulse issue
 ARM_ACCEPT_WINDOW_SECONDS = 30    # resets on each valid coin
 
+# --- License points / concurrent-user cap (End Goals #14/#17) ----------
+
+MAX_CONCURRENT_USERS_WITHOUT_LICENSE_POINTS = 2
+LICENSE_POINTS_SYNC_INTERVAL_SECONDS = 300  # 5 minutes
+
 # --- Rate model (STEP 1 rule #5) ----------------------------------------
 
 # PLACEHOLDER default for build/testing only -- actual production
