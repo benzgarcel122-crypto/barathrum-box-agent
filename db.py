@@ -82,6 +82,7 @@ CFG_SETUP_COMPLETE = "setup_complete"  # "1" once Setup Wizard has run
 # to reset their attempt budget).
 CFG_ADMIN_LOGIN_FAILED_ATTEMPTS = "admin_login_failed_attempts"
 CFG_ADMIN_LOGIN_LOCKED_UNTIL = "admin_login_locked_until"  # unix timestamp, empty/absent = not locked
+CFG_LICENSE_POINTS = "license_points"  # cached locally; "0" until Setup Wizard bind or first sync
 
 
 def get_connection():
