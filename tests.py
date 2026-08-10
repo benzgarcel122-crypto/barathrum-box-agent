@@ -526,6 +526,29 @@ class SetupWizardTests(BoxAgentTestCase):
         self.assertIn(b"do not match", resp.data)
         self.assertFalse(db.is_setup_complete())
 
+    def test_step1_stores_initial_nonzero_license_points_immediately(self):
+        """
+        End Goals #17 test case 14: on a successful license validation whose mocked response
+        includes a nonzero license_points, CFG_LICENSE_POINTS must be set to that exact value
+        immediately -- no need to wait for the first background sync.
+        """
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": True, "message": "License validated.", "license_points": 75,
+            }
+            self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "75")
+
+    def test_step1_defaults_license_points_to_zero_when_field_absent(self):
+        """Backward-compatible: a mocked/real response without license_points at all (e.g. an
+        older backend contract) must not blow up -- defaults to 0."""
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": True, "message": "License validated.",
+            }
+            self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "0")
+
 
 class HostapdConfigTests(unittest.TestCase):
     """
@@ -1009,6 +1032,216 @@ class VoucherSystemTests(BoxAgentTestCase):
         resp = self.client.get("/")
         self.assertIn(b"Connected. Enjoy!", resp.data)  # confirms active state actually rendered
         self.assertIn(b"Insert Voucher", resp.data)
+
+
+class LicensePointsCapTests(BoxAgentTestCase):
+    """End Goals #14/#17: license-points field, cloud->box sync channel, concurrent-user cap."""
+
+    def _make_active_session(self, mac):
+        session = session_manager.resolve_session(mac)
+        session_manager.handle_coin_pulse(session["session_token"])
+        return db.get_session_by_token(session["session_token"])
+
+    # -- test case 8: can_grant_new_active_slot() ---------------------------
+
+    def test_can_grant_new_active_slot_true_with_zero_points_and_under_cap(self):
+        self.assertTrue(session_manager.can_grant_new_active_slot())
+        self._make_active_session("aa:aa:aa:aa:aa:aa")
+        self.assertTrue(session_manager.can_grant_new_active_slot())
+
+    def test_can_grant_new_active_slot_false_with_zero_points_and_at_cap(self):
+        self._make_active_session("aa:aa:aa:aa:aa:aa")
+        self._make_active_session("bb:bb:bb:bb:bb:bb")
+        self.assertFalse(session_manager.can_grant_new_active_slot())
+
+    def test_can_grant_new_active_slot_always_true_with_positive_license_points(self):
+        db.set_config(db.CFG_LICENSE_POINTS, "5")
+        self._make_active_session("aa:aa:aa:aa:aa:aa")
+        self._make_active_session("bb:bb:bb:bb:bb:bb")
+        self._make_active_session("cc:cc:cc:cc:cc:cc")  # well above 2
+        self.assertTrue(session_manager.can_grant_new_active_slot())
+
+    # -- test case 9: coin arm gating ----------------------------------------
+
+    def test_coin_arm_rejected_for_fresh_session_when_capped_and_full(self):
+        self._make_active_session("aa:aa:aa:aa:aa:aa")
+        self._make_active_session("bb:bb:bb:bb:bb:bb")
+
+        third_client = portal_app.app.test_client()
+        resp = third_client.post(
+            "/api/insert-coin/arm", environ_overrides={"REMOTE_ADDR": "10.0.0.55"}
+        )
+        self.assertEqual(resp.status_code, 403)
+        data = resp.get_json()
+        self.assertFalse(data["armed"])
+        self.assertIn("Maximum users reached", data["error"])
+
+    def test_coin_arm_never_blocked_for_already_active_session_topping_up(self):
+        session_a = self._make_active_session("aa:aa:aa:aa:aa:aa")
+        self._make_active_session("bb:bb:bb:bb:bb:bb")
+
+        # A's own re-arm (topping up) must never be blocked regardless of cap state, even
+        # though the box is at the 2-user cap. Patch get_current_session so this request is
+        # genuinely A re-visiting, not a third device.
+        with patch("portal_app.get_current_session", return_value=(session_a, "aa:aa:aa:aa:aa:aa")):
+            resp = self.client.post("/api/insert-coin/arm")
+        self.assertNotEqual(resp.status_code, 403)
+
+    def test_coin_arm_never_blocked_for_paused_session_topping_up(self):
+        session = self._make_active_session("aa:aa:aa:aa:aa:aa")
+        session_manager.pause_session(session["session_token"])
+        self._make_active_session("bb:bb:bb:bb:bb:bb")
+        self._make_active_session("cc:cc:cc:cc:cc:cc")  # push active count to cap via other devices
+
+        # Simulate the paused device's own arm request -- its session is 'paused', never gated.
+        with patch("portal_app.get_current_session", return_value=(session, "aa:aa:aa:aa:aa:aa")):
+            resp = self.client.post("/api/insert-coin/arm")
+        self.assertNotEqual(resp.status_code, 403)
+
+    # -- test case 10: voucher redemption gating -----------------------------
+
+    def test_voucher_redemption_rejected_for_fresh_session_when_capped_and_full(self):
+        self._make_active_session("aa:aa:aa:aa:aa:aa")
+        self._make_active_session("bb:bb:bb:bb:bb:bb")
+        db.create_voucher("CAPPED99", 15)
+
+        third_client = portal_app.app.test_client()
+        resp = third_client.post(
+            "/api/insert-voucher", data={"voucher_code": "CAPPED99"},
+            environ_overrides={"REMOTE_ADDR": "10.0.0.77"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Maximum users reached", resp.get_json()["error"])
+
+        # Voucher code must remain completely unredeemed on this path.
+        voucher = db.get_voucher_by_code("CAPPED99")
+        self.assertIsNone(voucher["redeemed_at"])
+
+        # ... and CAN still be redeemed later once a slot opens.
+        session_manager.pause_session(db.get_all_active_sessions()[0]["session_token"])
+        resp2 = third_client.post(
+            "/api/insert-voucher", data={"voucher_code": "CAPPED99"},
+            environ_overrides={"REMOTE_ADDR": "10.0.0.77"},
+        )
+        self.assertEqual(resp2.status_code, 200)
+        voucher = db.get_voucher_by_code("CAPPED99")
+        self.assertIsNotNone(voucher["redeemed_at"])
+
+    def test_voucher_redemption_never_blocked_for_active_or_paused_session(self):
+        active = self._make_active_session("aa:aa:aa:aa:aa:aa")
+        self._make_active_session("bb:bb:bb:bb:bb:bb")  # box now at cap
+
+        db.create_voucher("ACTIVE001", 10)
+        # active's own top-up must not be blocked despite the box being at cap.
+        result = session_manager.handle_voucher_redeem(
+            active["session_token"], "ACTIVE001", "aa:aa:aa:aa:aa:aa"
+        )
+        self.assertEqual(result["status"], "active")
+
+        session_manager.pause_session(active["session_token"])
+        db.create_voucher("PAUSED001", 10)
+        result2 = session_manager.handle_voucher_redeem(
+            active["session_token"], "PAUSED001", "aa:aa:aa:aa:aa:aa"
+        )
+        self.assertEqual(result2["status"], "paused")  # top-up while paused, never forced active
+
+    # -- test case 11: resume gating -----------------------------------------
+
+    def test_resume_rejected_when_capped_and_full(self):
+        paused = self._make_active_session("aa:aa:aa:aa:aa:aa")
+        session_manager.pause_session(paused["session_token"])
+        self._make_active_session("bb:bb:bb:bb:bb:bb")
+        self._make_active_session("cc:cc:cc:cc:cc:cc")  # box now at the 2-user cap
+
+        with self.assertRaises(ValueError) as ctx:
+            session_manager.resume_session(paused["session_token"], requesting_mac_address="aa:aa:aa:aa:aa:aa")
+        self.assertIn("Maximum users reached", str(ctx.exception))
+        still_paused = db.get_session_by_token(paused["session_token"])
+        self.assertEqual(still_paused["status"], "paused")
+
+    def test_resume_allowed_when_under_cap_or_license_has_points(self):
+        paused = self._make_active_session("aa:aa:aa:aa:aa:aa")
+        session_manager.pause_session(paused["session_token"])
+
+        # Under cap (0 other active sessions) -- resume succeeds.
+        session_manager.resume_session(paused["session_token"], requesting_mac_address="aa:aa:aa:aa:aa:aa")
+        self.assertEqual(db.get_session_by_token(paused["session_token"])["status"], "active")
+
+        session_manager.pause_session(paused["session_token"])
+        self._make_active_session("bb:bb:bb:bb:bb:bb")
+        self._make_active_session("cc:cc:cc:cc:cc:cc")  # now at cap
+        db.set_config(db.CFG_LICENSE_POINTS, "10")  # licensed -- always allowed
+        session_manager.resume_session(paused["session_token"], requesting_mac_address="aa:aa:aa:aa:aa:aa")
+        self.assertEqual(db.get_session_by_token(paused["session_token"])["status"], "active")
+
+    def test_resume_mac_mismatch_behavior_completely_unchanged(self):
+        paused = self._make_active_session("aa:aa:aa:aa:aa:aa")
+        session_manager.pause_session(paused["session_token"])
+        with self.assertRaises(PermissionError):
+            session_manager.resume_session(paused["session_token"], requesting_mac_address="ff:ff:ff:ff:ff:ff")
+
+    # -- test case 12: sync_license_points() ---------------------------------
+
+    def test_sync_updates_cached_value_on_success(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {"valid": True, "license_points": 88}
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "88")
+
+    def test_sync_network_error_leaves_cached_value_untouched(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_POINTS, "42")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.side_effect = requests.exceptions.ConnectionError("no route to host")
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "42")
+
+    def test_sync_malformed_response_leaves_cached_value_untouched(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_POINTS, "42")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value.json.side_effect = ValueError("not json")
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "42")
+
+    def test_sync_invalid_response_leaves_cached_value_untouched(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_POINTS, "42")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {"valid": False, "message": "License key not recognized."}
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "42")
+
+    def test_sync_no_license_bound_yet_is_a_noop_no_http_call(self):
+        # CFG_LICENSE_KEY deliberately left unset.
+        with patch("session_manager.requests.post") as mock_post:
+            session_manager.sync_license_points()
+            mock_post.assert_not_called()
+
+    # -- test case 13: BackgroundLoop fires sync_license_points() on its own interval --
+
+    def test_background_loop_fires_license_points_sync_on_its_own_interval(self):
+        loop = session_manager.BackgroundLoop(
+            tick_interval_seconds=0.02,
+            # A huge interval so it doesn't fire on its own schedule during this short test --
+            # but note _run()'s accumulator starts at 0.0, so (like check_pause_abandonment
+            # already did before this task) it still fires once immediately on the loop's first
+            # iteration. That's pre-existing behavior, not something this task changes.
+            abandonment_check_interval_seconds=1000,
+            license_points_sync_interval_seconds=0.05,
+        )
+        with patch("session_manager.sync_license_points") as mock_sync, \
+             patch("session_manager.check_pause_abandonment") as mock_abandonment:
+            loop.start()
+            time.sleep(0.25)
+            loop.stop()
+        # sync fires repeatedly on its own short interval, independent of the tick interval and
+        # the (much longer) abandonment interval.
+        self.assertGreaterEqual(mock_sync.call_count, 2)
+        # abandonment fires exactly once (the immediate first-iteration fire), never again within
+        # this short window -- proves the two intervals are genuinely independent accumulators.
+        self.assertEqual(mock_abandonment.call_count, 1)
 
 
 class InstallScriptTagPinningTests(unittest.TestCase):
