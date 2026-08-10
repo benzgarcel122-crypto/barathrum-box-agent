@@ -85,10 +85,12 @@ def bootstrap():
 
     def _on_coin():
         # This callback runs on the GPIO watchdog thread -- the session
-        # this pulse belongs to is whichever session is CURRENTLY armed
-        # (see gpio_handler.CoinAcceptor.arm()'s docstring for the
-        # documented, accepted race behavior when two devices both tap
-        # "Insert Coin" within the same window: most-recent arm() wins).
+        # this pulse belongs to is whichever session is CURRENTLY armed.
+        # Since Session 96, coin-arming is exclusive: only one session
+        # can hold the arm lock at a time (see
+        # gpio_handler.CoinAcceptor.arm()'s docstring), so there is no
+        # race between two devices here -- a pulse always attributes to
+        # the single session that successfully armed.
         # Read fresh here rather than captured at callback-registration
         # time, since `acceptor` itself tracks the live value.
         armed_token = acceptor.get_armed_session_token()
