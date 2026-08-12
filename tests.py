@@ -1244,6 +1244,234 @@ class LicensePointsCapTests(BoxAgentTestCase):
         self.assertEqual(mock_abandonment.call_count, 1)
 
 
+class LicenseUnbindAndAdminPanelTests(BoxAgentTestCase):
+    """End Goals #11/#19/#20: persistent Bind/Unbind admin page, auto-unbind on genuine
+    license deletion (two-consecutive-404 requirement), and the shared _do_local_unbind()."""
+
+    def setUp(self):
+        super().setUp()
+        from werkzeug.security import generate_password_hash
+        db.set_config(db.CFG_ADMIN_PASSWORD_HASH, generate_password_hash("adminpass123"))
+        self.client.post("/admin/login", data={"password": "adminpass123"})
+
+    def _mock_resp(self, status_code, json_data):
+        mock = type("MockResp", (), {})()
+        mock.status_code = status_code
+        mock.json = lambda: json_data
+        return mock
+
+    # -- test case 8: two-consecutive-404 auto-unbind streak -----------------
+
+    def test_first_404_increments_streak_does_not_unbind(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value = self._mock_resp(404, {"valid": False, "message": "License key not recognized."})
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "1")
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "TESTKEY123")
+
+    def test_second_consecutive_404_unbinds(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value = self._mock_resp(404, {"valid": False, "message": "License key not recognized."})
+            session_manager.sync_license_points()
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "")
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "0")
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "0")
+
+    def test_404_then_success_then_404_is_still_only_a_streak_of_one(self):
+        """Confirms the streak genuinely requires CONSECUTIVE misses -- a successful poll in
+        between resets it, so two 404s that aren't back-to-back never trigger an unbind."""
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value = self._mock_resp(404, {"valid": False, "message": "not recognized"})
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "1")
+
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value = self._mock_resp(200, {"valid": True, "license_points": 3})
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "0")
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "TESTKEY123")  # still bound
+
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value = self._mock_resp(404, {"valid": False, "message": "not recognized"})
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "1")  # only 1, not 2
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "TESTKEY123")  # not unbound
+
+    def test_successful_poll_explicitly_resets_streak_to_zero(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_NOT_FOUND_STREAK, "1")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value = self._mock_resp(200, {"valid": True, "license_points": 9})
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "0")
+
+    # -- test case 9: non-404 failures never touch the streak -----------------
+
+    def test_network_error_does_not_touch_streak(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_NOT_FOUND_STREAK, "1")
+        db.set_config(db.CFG_LICENSE_POINTS, "42")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.side_effect = requests.exceptions.ConnectionError("no route to host")
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "1")  # untouched
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "42")  # untouched
+
+    def test_rate_limited_429_shaped_response_does_not_touch_streak(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_NOT_FOUND_STREAK, "1")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value = self._mock_resp(
+                429, {"valid": False, "message": "Too many attempts. Please wait a few minutes and try again."}
+            )
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "1")  # untouched, not incremented
+
+    def test_malformed_json_does_not_touch_streak(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_NOT_FOUND_STREAK, "1")
+        with patch("session_manager.requests.post") as mock_post:
+            mock_post.return_value.json.side_effect = ValueError("not json")
+            session_manager.sync_license_points()
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "1")  # untouched
+
+    # -- test case 10: _do_local_unbind() --------------------------------------
+
+    def test_do_local_unbind_clears_all_three_config_keys(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_POINTS, "50")
+        db.set_config(db.CFG_LICENSE_NOT_FOUND_STREAK, "1")
+
+        session_manager._do_local_unbind()
+
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "")
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "0")
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "0")
+
+    def test_do_local_unbind_reverts_to_2_user_cap(self):
+        db.set_config(db.CFG_LICENSE_POINTS, "50")
+        session = session_manager.resolve_session("aa:aa:aa:aa:aa:aa")
+        session_manager.handle_coin_pulse(session["session_token"])
+        session2 = session_manager.resolve_session("bb:bb:bb:bb:bb:bb")
+        session_manager.handle_coin_pulse(session2["session_token"])
+        self.assertTrue(session_manager.can_grant_new_active_slot())  # unlimited while licensed
+
+        session_manager._do_local_unbind()
+
+        self.assertFalse(session_manager.can_grant_new_active_slot())  # back to 2-user cap, now full
+
+    # -- test case 11: admin_license GET ---------------------------------------
+
+    def test_admin_license_requires_login(self):
+        anon_client = portal_app.app.test_client()
+        resp = anon_client.get("/admin/license")
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/admin/login", resp.headers["Location"])
+
+    def test_admin_license_get_shows_bind_form_when_unbound(self):
+        resp = self.client.get("/admin/license")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"Bind a license", resp.data)
+        self.assertNotIn(b"Unbind license", resp.data)
+
+    def test_admin_license_get_shows_unbind_form_and_cached_points_when_bound(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_POINTS, "17")
+
+        resp = self.client.get("/admin/license")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"Unbind license", resp.data)
+        self.assertIn(b"TESTKEY123", resp.data)
+        self.assertIn(b"17", resp.data)
+        self.assertNotIn(b"Bind a license", resp.data)
+
+    # -- test case 12: admin_license POST bind ---------------------------------
+
+    def test_bind_valid_key_stores_config_and_shows_success(self):
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": True, "message": "License validated.", "license_points": 12,
+            }
+            resp = self.client.post(
+                "/admin/license", data={"action": "bind", "license_key": "NEWKEY456"}
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"bound successfully", resp.data)
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "NEWKEY456")
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "12")
+
+    def test_bind_invalid_key_shows_error_stores_nothing(self):
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": False, "message": "License key not recognized.",
+            }
+            resp = self.client.post(
+                "/admin/license", data={"action": "bind", "license_key": "BADKEY"}
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"not recognized", resp.data)
+        self.assertFalse(db.get_config(db.CFG_LICENSE_KEY))
+
+    def test_bind_network_failure_fails_closed_stores_nothing(self):
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.side_effect = requests.exceptions.ConnectionError("no route to host")
+            resp = self.client.post(
+                "/admin/license", data={"action": "bind", "license_key": "NEWKEY456"}
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"Could not reach the license server", resp.data)
+        self.assertFalse(db.get_config(db.CFG_LICENSE_KEY))
+
+    # -- test case 13: admin_license POST unbind -------------------------------
+
+    def test_unbind_correct_password_effects_local_unbind_and_shows_success(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        db.set_config(db.CFG_LICENSE_POINTS, "20")
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {"valid": True, "message": "License unbound."}
+            resp = self.client.post(
+                "/admin/license", data={"action": "unbind", "password": "correctpw"}
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"unbound successfully", resp.data)
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "")
+        self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "0")
+        self.assertEqual(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK), "0")
+
+    def test_unbind_incorrect_password_shows_error_leaves_bound(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {"valid": False, "message": "Incorrect recovery password."}
+            resp = self.client.post(
+                "/admin/license", data={"action": "unbind", "password": "wrongpw"}
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"Incorrect recovery password", resp.data)
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "TESTKEY123")  # unchanged
+
+    # -- test case 14: no-op guards, no crash ----------------------------------
+
+    def test_bind_action_while_already_bound_is_a_graceful_noop(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+        resp = self.client.post(
+            "/admin/license", data={"action": "bind", "license_key": "SOMEOTHERKEY"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "TESTKEY123")  # unchanged, no crash
+
+    def test_unbind_action_while_not_bound_is_a_graceful_noop(self):
+        resp = self.client.post(
+            "/admin/license", data={"action": "unbind", "password": "anything"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(db.get_config(db.CFG_LICENSE_KEY))  # unchanged, no crash
+
+
 class InstallScriptTagPinningTests(unittest.TestCase):
     """Session 88 + Session 90 (Security Findings #14/#15, tracker row 27):
     install.sh must pin step_clone_or_update_repo() to the immutable
