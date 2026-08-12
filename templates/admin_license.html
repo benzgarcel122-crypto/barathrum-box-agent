@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>License — Admin</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="admin-shell">
+  <nav>
+    <div class="brand">Barathrum</div>
+    <a href="/admin">Status</a>
+    <a href="/admin/sessions">Sessions</a>
+    <a href="/admin/vouchers">Vouchers</a>
+    <a href="/admin/license" class="active">License</a>
+    <a href="/admin/settings">Settings</a>
+    <a href="/admin/logout" class="logout">Log out</a>
+  </nav>
+  <main>
+    <h1>License</h1>
+    {% if error %}<p class="field-hint" style="color:#c0392b;">{{ error }}</p>{% endif %}
+    {% if success %}<p class="field-hint" style="color:#2e7d32;">{{ success }}</p>{% endif %}
+
+    {% if current_key %}
+      <section>
+        <h2>Bound license</h2>
+        <p class="hint">Key: {{ current_key }} · Cached points: {{ license_points }}</p>
+      </section>
+      <section>
+        <h2>Unbind license</h2>
+        <p class="hint">Enter this license's recovery password to unbind it from this box.</p>
+        <form method="post">
+          <input type="hidden" name="action" value="unbind">
+          <label>Recovery password</label>
+          <input type="password" name="password" autocomplete="off" required>
+          <button type="submit" class="btn-primary">Unbind License</button>
+        </form>
+      </section>
+    {% else %}
+      <section>
+        <h2>Bind a license</h2>
+        <form method="post">
+          <input type="hidden" name="action" value="bind">
+          <label>License key</label>
+          <input type="text" name="license_key" required>
+          <button type="submit" class="btn-primary">Bind License</button>
+        </form>
+      </section>
+    {% endif %}
+  </main>
+</div>
+</body>
+</html>
