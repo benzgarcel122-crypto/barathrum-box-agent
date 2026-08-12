@@ -55,15 +55,30 @@ def can_grant_new_active_slot():
     return active_count < config.MAX_CONCURRENT_USERS_WITHOUT_LICENSE_POINTS
 
 
+def _do_local_unbind():
+    """Shared by both End Goal #20's manual Unbind action and #19's auto-unbind-on-deletion
+    path -- both end in the exact same local state. Clears the box's own record of being bound
+    to any license at all; can_grant_new_active_slot() naturally reverts to the 2-user cap the
+    moment CFG_LICENSE_POINTS reads back as absent/"0"."""
+    db.set_config(db.CFG_LICENSE_KEY, "")
+    db.set_config(db.CFG_LICENSE_POINTS, "0")
+    db.set_config(db.CFG_LICENSE_NOT_FOUND_STREAK, "0")
+    logger.info("Box unbound from its license -- reverted to the 2-user concurrent cap.")
+
+
 def sync_license_points():
     """
-    End Goals #17 -- periodic poll (see BackgroundLoop), fetches this box's bound license's
-    current points balance and caches it locally (db.CFG_LICENSE_POINTS), which
-    can_grant_new_active_slot() reads. Deliberately network-tolerant: on ANY failure (no license
-    bound yet, network unreachable, malformed response), the existing cached value is left
-    completely untouched, just a logged warning -- a transient hiccup must never suddenly drop
-    an already-unlocked box back to the 2-user cap. The cached value only changes on a genuinely
-    successful poll.
+    End Goals #17 -- periodic poll, unchanged in spirit from Session 98/99. NEW this task (End
+    Goal #19's box-side half): a genuine HTTP 404 ("License key not recognized") means the
+    bound license was deleted server-side (machines/management/commands/
+    cleanup_unclaimed_licenses.py, now gated on license_points == 0 too). Requires TWO
+    CONSECUTIVE 404s (not one) before auto-unbinding -- Investigator design decision, this
+    session: a single flaky/wrong-environment 404 wrongly nuking a legitimate binding would be
+    a real, hard-to-recover customer-facing failure. At a 60s poll interval (config.py,
+    Session 99) this costs at most ~60 extra seconds. The streak resets to 0 on ANY successful
+    (valid:true) response. Every OTHER failure mode (network error, malformed JSON, 429 rate
+    limit, or any other non-2xx) is still fully network-tolerant exactly as before: cached value
+    left completely untouched, streak untouched, just a logged warning.
     """
     license_key = db.get_config(db.CFG_LICENSE_KEY)
     if not license_key:
@@ -78,9 +93,30 @@ def sync_license_points():
     except (requests.exceptions.RequestException, ValueError):
         logger.warning("License points sync failed -- network/parse error, keeping cached value.")
         return
+
+    if resp.status_code == 404:
+        streak = int(db.get_config(db.CFG_LICENSE_NOT_FOUND_STREAK, "0") or "0") + 1
+        db.set_config(db.CFG_LICENSE_NOT_FOUND_STREAK, str(streak))
+        if streak >= 2:
+            logger.warning(
+                "License key not recognized by backend on %d consecutive polls -- "
+                "auto-unbinding (End Goal #19).", streak,
+            )
+            _do_local_unbind()
+        else:
+            logger.warning(
+                "License key not recognized by backend (1st consecutive miss) -- "
+                "not unbinding yet, waiting for a second consecutive miss."
+            )
+        return
+
     if not data.get("valid"):
+        # Any other non-2xx (429 rate-limited, etc.) -- transient, not a deletion signal.
+        # Explicitly does NOT touch the not-found streak either way.
         logger.warning("License points sync failed -- %s", data.get("message", "unknown error"))
         return
+
+    db.set_config(db.CFG_LICENSE_NOT_FOUND_STREAK, "0")
     db.set_config(db.CFG_LICENSE_POINTS, str(int(data.get("license_points", 0))))
 
 
