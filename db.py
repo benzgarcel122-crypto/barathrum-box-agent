@@ -83,6 +83,8 @@ CFG_SETUP_COMPLETE = "setup_complete"  # "1" once Setup Wizard has run
 CFG_ADMIN_LOGIN_FAILED_ATTEMPTS = "admin_login_failed_attempts"
 CFG_ADMIN_LOGIN_LOCKED_UNTIL = "admin_login_locked_until"  # unix timestamp, empty/absent = not locked
 CFG_LICENSE_POINTS = "license_points"  # cached locally; "0" until Setup Wizard bind or first sync
+CFG_LICENSE_NOT_FOUND_STREAK = "license_not_found_streak"  # consecutive 404s from the sync poll;
+# resets to 0 on any successful (valid) response -- see session_manager.sync_license_points()
 
 
 def get_connection():
