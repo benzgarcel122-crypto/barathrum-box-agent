@@ -420,6 +420,78 @@ def admin_vouchers():
     )
 
 
+@app.route("/admin/license", methods=["GET", "POST"])
+@admin_login_required
+def admin_license():
+    """
+    End Goals #11 (persistent Bind License, not just the one-time Setup Wizard) + #20 (Unbind
+    License, gated by the recovery password -- verified server-side via
+    POST /api/box/unbind-license/, since the box never holds the password hash itself). One
+    page, toggles between a Bind form and an Unbind form based on whether CFG_LICENSE_KEY is
+    currently set -- a box can only ever be bound to one license at a time, so re-binding over
+    an existing one is not offered; Unbind first, per this session's PM decision that either
+    order is valid but re-binding without unbinding first would leave the old key's grant
+    dangling server-side.
+    """
+    current_key = db.get_config(db.CFG_LICENSE_KEY)
+    error = None
+    success = None
+
+    if request.method == "POST":
+        action = request.form.get("action")
+
+        if action == "bind" and not current_key:
+            license_key = request.form.get("license_key", "").strip()
+            if not license_key:
+                error = "Enter a license key."
+            else:
+                try:
+                    resp = requests.post(
+                        f"{config.DASHBOARD_API_BASE_URL}/api/box/validate-license/",
+                        json={"license_key": license_key},
+                        timeout=10,
+                    )
+                    data = resp.json()
+                except (requests.exceptions.RequestException, ValueError):
+                    error = "Could not reach the license server. Check your internet connection and try again."
+                else:
+                    if not data.get("valid"):
+                        error = data.get("message", "License key not recognized.")
+                    else:
+                        db.set_config(db.CFG_LICENSE_KEY, license_key)
+                        db.set_config(db.CFG_LICENSE_POINTS, str(data.get("license_points", 0)))
+                        db.set_config(db.CFG_LICENSE_NOT_FOUND_STREAK, "0")
+                        success = "License bound successfully."
+                        current_key = license_key
+
+        elif action == "unbind" and current_key:
+            password = request.form.get("password", "")
+            try:
+                resp = requests.post(
+                    f"{config.DASHBOARD_API_BASE_URL}/api/box/unbind-license/",
+                    json={"license_key": current_key, "password": password},
+                    timeout=10,
+                )
+                data = resp.json()
+            except (requests.exceptions.RequestException, ValueError):
+                error = "Could not reach the license server. Check your internet connection and try again."
+            else:
+                if not data.get("valid"):
+                    error = data.get("message", "Incorrect recovery password.")
+                else:
+                    session_manager._do_local_unbind()
+                    success = "License unbound successfully."
+                    current_key = ""
+
+    return render_template(
+        "admin_license.html",
+        current_key=current_key,
+        license_points=db.get_config(db.CFG_LICENSE_POINTS, "0"),
+        error=error,
+        success=success,
+    )
+
+
 # --- Setup Wizard (rule #11) ---------------------------------------------
 
 @app.route("/setup", methods=["GET", "POST"])
