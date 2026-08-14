@@ -22,6 +22,7 @@
 
   {% elif step == 2 %}
     <p class="hint">Step 2 of 4 — Create your admin account, and set your customer-facing WiFi name.</p>
+    {% if recovery_notice %}<p class="field-hint" style="color:#2e7d32;">{{ recovery_notice }}</p>{% endif %}
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     <form method="post">
       <input type="hidden" name="step" value="2">
