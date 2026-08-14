@@ -549,6 +549,56 @@ class SetupWizardTests(BoxAgentTestCase):
             self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
         self.assertEqual(db.get_config(db.CFG_LICENSE_POINTS), "0")
 
+    def test_screen1_already_active_license_proceeds_to_step2_without_error_and_no_key_stored(self):
+        """End Goal #21: an already-active key must not be treated as a genuine error -- the
+        wizard proceeds straight to step 2 with a recovery notice instead, and no license key
+        is stashed in the session for step 2 to later store."""
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": False, "already_active": True,
+                "message": "This license is already active on another installation.",
+            }
+            resp = self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"Create your admin account, and set your customer-facing WiFi name.", resp.data)
+        self.assertIn(b"already active elsewhere", resp.data)
+        with self.client.session_transaction() as sess:
+            self.assertNotIn("setup_license_key", sess)
+
+    def test_screen1_already_active_flow_completes_wizard_with_empty_stored_license_key(self):
+        """The wizard must still complete fully after the already_active branch -- with no
+        license key attached, ready for the operator to Bind for real afterward via the
+        License page (End Goal #21's second recovery step)."""
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": False, "already_active": True,
+                "message": "This license is already active on another installation.",
+            }
+            self.client.post("/setup", data={"step": "1", "license_key": "TESTKEY123"})
+
+        resp = self.client.post(
+            "/setup",
+            data={
+                "step": "2",
+                "customer_ssid": "MyShopWiFi",
+                "admin_password": "correct horse battery",
+                "confirm_password": "correct horse battery",
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(db.is_setup_complete())
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "")
+
+    def test_screen1_genuine_error_still_shows_error_and_stays_on_step1(self):
+        """Proves the new already_active branch doesn't accidentally swallow genuine errors --
+        a response with no already_active key at all must still hit the existing error path."""
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": False, "message": "License key not recognized.",
+            }
+            resp = self.client.post("/setup", data={"step": "1", "license_key": "NOSUCHKEY"})
+        self.assertIn(b"License key not recognized.", resp.data)
+
 
 class HostapdConfigTests(unittest.TestCase):
     """
@@ -1372,11 +1422,15 @@ class LicenseUnbindAndAdminPanelTests(BoxAgentTestCase):
         self.assertEqual(resp.status_code, 302)
         self.assertIn("/admin/login", resp.headers["Location"])
 
-    def test_admin_license_get_shows_bind_form_when_unbound(self):
+    def test_admin_license_get_shows_bind_form_always(self):
+        """Session prior to End Goal #21: this used to assert Unbind was absent when unbound.
+        Now BOTH forms always render unconditionally -- Unbind must be reachable even when the
+        box's own local CFG_LICENSE_KEY is empty (always true right after a reflash), so the
+        operator can recover a license the server still considers active elsewhere."""
         resp = self.client.get("/admin/license")
         self.assertEqual(resp.status_code, 200)
         self.assertIn(b"Bind a license", resp.data)
-        self.assertNotIn(b"Unbind license", resp.data)
+        self.assertIn(b"Unbind license", resp.data)
 
     def test_admin_license_get_shows_unbind_form_and_cached_points_when_bound(self):
         db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
@@ -1388,7 +1442,7 @@ class LicenseUnbindAndAdminPanelTests(BoxAgentTestCase):
         self.assertIn(b"Unbind license", resp.data)
         self.assertIn(b"TESTKEY123", resp.data)
         self.assertIn(b"17", resp.data)
-        self.assertNotIn(b"Bind a license", resp.data)
+        self.assertIn(b"Bind a license", resp.data)  # both forms still render together
 
     # -- test case 12: admin_license POST bind ---------------------------------
 
@@ -1435,7 +1489,8 @@ class LicenseUnbindAndAdminPanelTests(BoxAgentTestCase):
         with patch("portal_app.requests.post") as mock_post:
             mock_post.return_value.json.return_value = {"valid": True, "message": "License unbound."}
             resp = self.client.post(
-                "/admin/license", data={"action": "unbind", "password": "correctpw"}
+                "/admin/license",
+                data={"action": "unbind", "license_key": "TESTKEY123", "password": "correctpw"},
             )
         self.assertEqual(resp.status_code, 200)
         self.assertIn(b"unbound successfully", resp.data)
@@ -1448,7 +1503,8 @@ class LicenseUnbindAndAdminPanelTests(BoxAgentTestCase):
         with patch("portal_app.requests.post") as mock_post:
             mock_post.return_value.json.return_value = {"valid": False, "message": "Incorrect recovery password."}
             resp = self.client.post(
-                "/admin/license", data={"action": "unbind", "password": "wrongpw"}
+                "/admin/license",
+                data={"action": "unbind", "license_key": "TESTKEY123", "password": "wrongpw"},
             )
         self.assertEqual(resp.status_code, 200)
         self.assertIn(b"Incorrect recovery password", resp.data)
@@ -1456,20 +1512,79 @@ class LicenseUnbindAndAdminPanelTests(BoxAgentTestCase):
 
     # -- test case 14: no-op guards, no crash ----------------------------------
 
-    def test_bind_action_while_already_bound_is_a_graceful_noop(self):
+    def test_bind_action_while_already_bound_now_succeeds_and_overwrites_local_key(self):
+        """End Goal #21: the local-state gate on Bind is gone -- whether a key can actually
+        (re)activate is now decided server-side (validate-license's 409/already_active), not
+        guessed locally from current_key. A Bind attempt while a different key is already bound
+        locally now proceeds and, on a successful server response, overwrites the local key."""
         db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
-        resp = self.client.post(
-            "/admin/license", data={"action": "bind", "license_key": "SOMEOTHERKEY"}
-        )
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {
+                "valid": True, "message": "License validated.", "license_points": 5,
+            }
+            resp = self.client.post(
+                "/admin/license", data={"action": "bind", "license_key": "SOMEOTHERKEY"}
+            )
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "TESTKEY123")  # unchanged, no crash
+        self.assertEqual(db.get_config(db.CFG_LICENSE_KEY), "SOMEOTHERKEY")
 
     def test_unbind_action_while_not_bound_is_a_graceful_noop(self):
         resp = self.client.post(
             "/admin/license", data={"action": "unbind", "password": "anything"}
         )
         self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"Enter a license key", resp.data)
         self.assertFalse(db.get_config(db.CFG_LICENSE_KEY))  # unchanged, no crash
+
+
+class LicenseReflashRecoveryAdminPanelTests(BoxAgentTestCase):
+    """
+    End Goal #21: the reflash-recovery scenario at the admin_license page level -- Unbind must
+    be reachable and usable even when this box's own local CFG_LICENSE_KEY is empty (always
+    true right after a reflash, since local SQLite config is wiped). Kept separate from
+    LicenseUnbindAndAdminPanelTests and SetupWizardTests per this task's file-placement note.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from werkzeug.security import generate_password_hash
+        db.set_config(db.CFG_ADMIN_PASSWORD_HASH, generate_password_hash("adminpass123"))
+        self.client.post("/admin/login", data={"password": "adminpass123"})
+
+    def test_unbind_form_reachable_and_has_license_key_field_even_with_no_local_current_key(self):
+        db.set_config(db.CFG_LICENSE_KEY, "")
+
+        resp = self.client.get("/admin/license")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"Unbind license", resp.data)
+        self.assertIn(b'name="license_key"', resp.data)
+        self.assertIn(b'name="password"', resp.data)
+
+    def test_unbind_succeeds_using_manually_typed_license_key_when_local_state_is_empty(self):
+        db.set_config(db.CFG_LICENSE_KEY, "")
+        with patch("portal_app.requests.post") as mock_post:
+            mock_post.return_value.json.return_value = {"valid": True, "message": "License unbound."}
+            resp = self.client.post(
+                "/admin/license",
+                data={"action": "unbind", "license_key": "BXK7-BOX-A", "password": "correctpw"},
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"unbound successfully", resp.data)
+        mock_post.assert_called_once()
+        self.assertEqual(
+            mock_post.call_args.kwargs["json"],
+            {"license_key": "BXK7-BOX-A", "password": "correctpw"},
+        )
+
+    def test_bind_form_still_reachable_when_current_key_is_set(self):
+        db.set_config(db.CFG_LICENSE_KEY, "TESTKEY123")
+
+        resp = self.client.get("/admin/license")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b"Bind a license", resp.data)
+        self.assertIn(b"Unbind license", resp.data)
 
 
 class InstallScriptTagPinningTests(unittest.TestCase):
