@@ -426,12 +426,17 @@ def admin_license():
     """
     End Goals #11 (persistent Bind License, not just the one-time Setup Wizard) + #20 (Unbind
     License, gated by the recovery password -- verified server-side via
-    POST /api/box/unbind-license/, since the box never holds the password hash itself). One
-    page, toggles between a Bind form and an Unbind form based on whether CFG_LICENSE_KEY is
-    currently set -- a box can only ever be bound to one license at a time, so re-binding over
-    an existing one is not offered; Unbind first, per this session's PM decision that either
-    order is valid but re-binding without unbinding first would leave the old key's grant
-    dangling server-side.
+    POST /api/box/unbind-license/, since the box never holds the password hash itself).
+
+    Both the Bind and Unbind forms are always rendered together, unconditionally -- End Goal
+    #21's reflash-recovery flow requires Unbind to be reachable even when this box's own local
+    CFG_LICENSE_KEY is empty (which it always is right after a reflash, since local SQLite
+    config is wiped). Whether Bind or Unbind is the correct action for a given key is now
+    decided server-side by validate-license's 409/already_active response, not guessed locally
+    from current_key -- so neither action is gated on current_key anymore. The Unbind form
+    reads its own license_key field from the submission (pre-filled with current_key as a
+    convenience when the box does remember one, but always editable and always the value
+    actually sent), rather than trusting local state that may be stale or absent.
     """
     current_key = db.get_config(db.CFG_LICENSE_KEY)
     error = None
@@ -440,7 +445,7 @@ def admin_license():
     if request.method == "POST":
         action = request.form.get("action")
 
-        if action == "bind" and not current_key:
+        if action == "bind":
             license_key = request.form.get("license_key", "").strip()
             if not license_key:
                 error = "Enter a license key."
@@ -456,6 +461,9 @@ def admin_license():
                     error = "Could not reach the license server. Check your internet connection and try again."
                 else:
                     if not data.get("valid"):
+                        # Covers both the genuine "key not recognized" case and End Goal #21's
+                        # already_active case -- validate-license's message field is written to
+                        # be directly operator-readable for both, no special-casing needed here.
                         error = data.get("message", "License key not recognized.")
                     else:
                         db.set_config(db.CFG_LICENSE_KEY, license_key)
@@ -464,24 +472,28 @@ def admin_license():
                         success = "License bound successfully."
                         current_key = license_key
 
-        elif action == "unbind" and current_key:
+        elif action == "unbind":
+            license_key = request.form.get("license_key", "").strip()
             password = request.form.get("password", "")
-            try:
-                resp = requests.post(
-                    f"{config.DASHBOARD_API_BASE_URL}/api/box/unbind-license/",
-                    json={"license_key": current_key, "password": password},
-                    timeout=10,
-                )
-                data = resp.json()
-            except (requests.exceptions.RequestException, ValueError):
-                error = "Could not reach the license server. Check your internet connection and try again."
+            if not license_key:
+                error = "Enter a license key."
             else:
-                if not data.get("valid"):
-                    error = data.get("message", "Incorrect recovery password.")
+                try:
+                    resp = requests.post(
+                        f"{config.DASHBOARD_API_BASE_URL}/api/box/unbind-license/",
+                        json={"license_key": license_key, "password": password},
+                        timeout=10,
+                    )
+                    data = resp.json()
+                except (requests.exceptions.RequestException, ValueError):
+                    error = "Could not reach the license server. Check your internet connection and try again."
                 else:
-                    session_manager._do_local_unbind()
-                    success = "License unbound successfully."
-                    current_key = ""
+                    if not data.get("valid"):
+                        error = data.get("message", "Incorrect recovery password.")
+                    else:
+                        session_manager._do_local_unbind()
+                        success = "License unbound successfully."
+                        current_key = ""
 
     return render_template(
         "admin_license.html",
@@ -534,6 +546,21 @@ def setup_wizard():
             )
 
         if not data.get("valid"):
+            if data.get("already_active"):
+                # End Goal #21 recovery case: the key is real but already bound elsewhere (or
+                # to this same box's previous, now-wiped installation). Do NOT attach a license
+                # key to this fresh install yet -- proceed to account creation with no key
+                # stored, and the operator completes recovery via the persistent
+                # /admin/license page (Unbind, then Bind) after logging in.
+                # flask_session["setup_license_key"] is deliberately NOT set here.
+                return render_template(
+                    "setup.html", step=2,
+                    recovery_notice=(
+                        "This license is already active elsewhere. Continue creating your "
+                        "account below -- once you're logged in, go to the License page to "
+                        "Unbind and re-Bind this license key to finish recovering this box."
+                    ),
+                )
             return render_template(
                 "setup.html", step=1,
                 error=data.get("message", "License key not recognized."),
