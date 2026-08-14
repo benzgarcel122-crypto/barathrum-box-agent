@@ -27,27 +27,29 @@
         <h2>Bound license</h2>
         <p class="hint">Key: {{ current_key }} · Cached points: {{ license_points }}</p>
       </section>
-      <section>
-        <h2>Unbind license</h2>
-        <p class="hint">Enter this license's recovery password to unbind it from this box.</p>
-        <form method="post">
-          <input type="hidden" name="action" value="unbind">
-          <label>Recovery password</label>
-          <input type="password" name="password" autocomplete="off" required>
-          <button type="submit" class="btn-primary">Unbind License</button>
-        </form>
-      </section>
-    {% else %}
-      <section>
-        <h2>Bind a license</h2>
-        <form method="post">
-          <input type="hidden" name="action" value="bind">
-          <label>License key</label>
-          <input type="text" name="license_key" required>
-          <button type="submit" class="btn-primary">Bind License</button>
-        </form>
-      </section>
     {% endif %}
+
+    <section>
+      <h2>Bind a license</h2>
+      <form method="post">
+        <input type="hidden" name="action" value="bind">
+        <label>License key</label>
+        <input type="text" name="license_key" required>
+        <button type="submit" class="btn-primary">Bind License</button>
+      </form>
+    </section>
+    <section>
+      <h2>Unbind license</h2>
+      <p class="hint">Enter the license key and its recovery password to unbind it from this box. If this box was just reflashed and doesn't remember its key, type it in manually.</p>
+      <form method="post">
+        <input type="hidden" name="action" value="unbind">
+        <label>License key</label>
+        <input type="text" name="license_key" value="{{ current_key }}" required>
+        <label>Recovery password</label>
+        <input type="password" name="password" autocomplete="off" required>
+        <button type="submit" class="btn-primary">Unbind License</button>
+      </form>
+    </section>
   </main>
 </div>
 </body>
